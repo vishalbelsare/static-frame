@@ -1,4 +1,4 @@
-.. figure:: https://raw.githubusercontent.com/InvestmentSystems/static-frame/master/doc/images/sf-logo-web_icon-small.png
+.. figure:: https://raw.githubusercontent.com/static-frame/static-frame/master/doc/images/sf-logo-web_icon-small.png
    :align: center
 
 
@@ -12,24 +12,12 @@
   :target: https://anaconda.org/conda-forge/static-frame
 
 
-.. image:: https://img.shields.io/codecov/c/github/InvestmentSystems/static-frame.svg
-  :target: https://codecov.io/gh/InvestmentSystems/static-frame
+.. image:: https://img.shields.io/codecov/c/github/static-frame/static-frame.svg
+  :target: https://codecov.io/gh/static-frame/static-frame
 
 
-
-.. image:: https://img.shields.io/github/workflow/status/InvestmentSystems/static-frame/Test?label=test&logo=Github
-  :target: https://github.com/InvestmentSystems/static-frame/actions?query=workflow%3ATest
-
-.. image:: https://img.shields.io/github/workflow/status/InvestmentSystems/static-frame/TestForward?label=test-forward&logo=Github
-  :target: https://github.com/InvestmentSystems/static-frame/actions?query=workflow%3ATestForward
-
-.. image:: https://img.shields.io/github/workflow/status/InvestmentSystems/static-frame/Quality?label=quality&logo=Github
-  :target: https://github.com/InvestmentSystems/static-frame/actions?query=workflow%3AQuality
-
-
-
-.. image:: https://img.shields.io/readthedocs/static-frame.svg
-  :target: https://static-frame.readthedocs.io/en/latest
+.. image:: https://img.shields.io/github/actions/workflow/status/static-frame/static-frame/ci.yml?branch=master&label=test&logo=Github
+  :target: https://github.com/static-frame/static-frame/actions/workflows/ci.yml
 
 .. image:: https://img.shields.io/badge/hypothesis-tested-brightgreen.svg
   :target: https://hypothesis.readthedocs.io
@@ -37,52 +25,55 @@
 .. image:: https://img.shields.io/pypi/status/static-frame.svg
   :target: https://pypi.org/project/static-frame
 
-.. image:: https://img.shields.io/badge/benchmarked%20by-asv-blue.svg
-  :target: https://investmentsystems.github.io/static-frame-benchmark
-
-
-.. image:: https://img.shields.io/badge/launch-binder-579ACA.svg?logo=data:image/png;base64,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
-   :target: https://mybinder.org/v2/gh/InvestmentSystems/static-frame-ftgu/default?urlpath=tree/index.ipynb
-
 
 
 static-frame
 =============
 
-A library of immutable and grow-only Pandas-like DataFrames with a more explicit and consistent interface. StaticFrame is suitable for applications in data science, data engineering, finance, scientific computing, and related fields where reducing opportunities for error by prohibiting in-place mutation is critical.
+Immutable and statically-typeable DataFrames with runtime type and data validation.
 
-While many interfaces are similar to Pandas, StaticFrame deviates from Pandas in many ways: all data is immutable, and all indices are unique; the full range of NumPy data types is preserved, and date-time indices use discrete NumPy types; hierarchical indices are seamlessly integrated; and uniform approaches to element, row, and column iteration and function application are provided. Core StaticFrame depends only on NumPy and two C-extension packages (maintained by the StaticFrame team): Pandas is not a dependency.
+Among the many Python DataFrame libraries, StaticFrame is an alternative that prioritizes correctness, maintainability, and reducing opportunities for error. Key features include:
 
-A wide variety of table formats are supported, including input from and output to CSV, TSV, JSON, MessagePack, Excel XLSX, SQLite, HDF5, NumPy, Pandas, Arrow, and Parquet; additionally, output to xarray, VisiData, HTML, RST, Markdown, and LaTeX is supported, as well as HTML representations in Jupyter notebooks. Full serialization is also available via custom NPZ and NPY encodings, the latter supporting memory mapping.
+* 🛡️ Immutable Data: Provides memory efficiency, excellent performance, and prohibits side effects.
+* 🗜️ Static Typing: Use Python type-hints to statically type index, columns, and columnar types.
+* 🚦 Runtime Validation: Use type hints and specialized validators for runtime type and data checks.
+* 🧭 Consistent Interface: An easy-to-learn, hierarchical, and intuitive API that avoids the many inconsistencies of Pandas.
+* 🧬 Comprehensive ``dtype`` Support: Full compatibility with all NumPy dtypes and datetime64 units.
+* 🔗 Broad Interoperability: Translate between Pandas, Arrow, Parquet, CSV, TSV, JSON, Excel XLSX, SQLite, and NumPy; output to xarray, VisiData, HTML, RST, Markdown, LaTeX, and Jupyter notebooks.
+* 🚀 Optimized Serialization & Memory Mapping: Fast disk I/O with custom NPZ and NPY encodings.
+* 💼 Multi-Table Containers: The ``Bus`` and ``Yarn`` provide interfaces to collections of tables with lazy data loading, well-suited for large datasets.
+* ⏳ Deferred Processing: The ``Batch`` provides a common interface for deferred processing of groups, windows, or any iterator.
+* 📚 Comprehensive Documentation: All API endpoints documented with thousands of easily runnable examples.
 
-StaticFrame features a family of multi-table containers: the Bus is a lazily-loaded container of tables, the Batch is a deferred processor of tables, the Yarn is virtual concatenation of many Buses, and the Quilt is a virtual concatenation of all tables within a single Bus or Yarn. All permit operating on large collections of tables with minimal memory overhead, as well as writing too and reading from zipped bundles of pickles, NPZ, Parquet, or delimited files, as well as XLSX workbooks, SQLite, and HDF5.
 
-
-Code: https://github.com/InvestmentSystems/static-frame
+Code: https://github.com/static-frame/static-frame
 
 Docs: http://static-frame.readthedocs.io
 
 Packages: https://pypi.org/project/static-frame
 
-Jupyter Notebook Tutorial: `Launch Binder <https://mybinder.org/v2/gh/InvestmentSystems/static-frame-ftgu/default?urlpath=tree/index.ipynb>`_
-
-Context: `Ten Reasons to Use StaticFrame instead of Pandas <https://dev.to/flexatone/ten-reasons-to-use-staticframe-instead-of-pandas-4aad>`_
+API Search: https://staticframe.dev
 
 
-Installation
+
+Installation via ``pip``
 -------------------------------
 
-Install StaticFrame via PIP::
+Install StaticFrame with ``pip``. Note that pre-built wheels are published for all supported Python versions and platforms (including Apple Silicon platforms)::
 
     pip install static-frame
 
-Or, install StaticFrame via conda::
-
-    conda install -c conda-forge static-frame
-
-To install full support of input and output routines via PIP::
+To install optional dependencies for full support of input and output formats (such as XLSX and Parquet) via ``pip``::
 
     pip install static-frame [extras]
+
+
+Installation via ``conda``
+-------------------------------
+
+StaticFrame can be installed via ``conda`` with the ``conda-forge`` channel. Note that pre-built wheels of StaticFrame and all compiled dependencies are available through ``pip`` and may offer more compatibility than a ``conda``-based installation ::
+
+    conda install -c conda-forge static-frame
 
 
 Dependencies
@@ -90,403 +81,134 @@ Dependencies
 
 Core StaticFrame requires the following:
 
-- Python >= 3.6
-- NumPy >= 1.17.4
-- automap >= 0.4.8
-- arraykit >= 0.1.8
+- Python>=3.10
+- numpy>=1.24.3 (numpy>=2 is supported)
+- arraykit==1.12.0
+- typing-extensions>=4.12.0
 
 For extended input and output, the following packages are required:
 
-- pandas >= 0.23.4
-- xlsxwriter >= 1.1.2
-- openpyxl >= 3.0.9
-- xarray >= 0.13.0
-- tables >= 3.6.1
-- pyarrow >= 0.16.0
-- visidata >= 2.4
-
-
-Quick-Start Guide
----------------------
-
-StaticFrame provides numerous methods for loading and creating data, either as a 1D ``Series`` or a 2D ``Frame``. All creation routines are exposed as alternate constructors on the desired class, such as ``Frame.from_records()``, ``Frame.from_csv()`` or ``Frame.from_pandas()``.
-
-.. note::
-
-    For a concise overview of all StaticFrame interfaces, see `API Overview <https://static-frame.readthedocs.io/en/latest/api_overview>`_.
-
-
-For example, we can load JSON data from a URL using ``Frame.from_json_url()``, and then use ``Frame.head()`` to reduce the displayed output to just the first five rows. (Passing explicit ``dtypes`` is only necessary on Windows.)
-
->>> import numpy as np
->>> import static_frame as sf
-
->>> frame = sf.Frame.from_json_url('https://jsonplaceholder.typicode.com/photos', dtypes=dict(albumId=np.int64, id=np.int64))
-
->>> frame.head()
-<Frame>
-<Index> albumId id      title                url                  thumbnailUrl         <<U12>
-<Index>
-0       1       1       accusamus beatae ... https://via.place... https://via.place...
-1       1       2       reprehenderit est... https://via.place... https://via.place...
-2       1       3       officia porro iur... https://via.place... https://via.place...
-3       1       4       culpa odio esse r... https://via.place... https://via.place...
-4       1       5       natus nisi omnis ... https://via.place... https://via.place...
-<int64> <int64> <int64> <<U86>               <<U38>               <<U38>
-
-
-.. note::
-
-    The Pandas CSV reader out-performs the NumPy-based reader in StaticFrame: thus, for now, using ``Frame.from_pandas(pd.read_csv(fp))`` is recommended for loading large CSV files.
-
-    For more information on Frame constructors, see `Frame: Constructor <https://static-frame.readthedocs.io/en/latest/api_detail/frame.html#frame-constructor>`_.
-
-
-As with a NumPy array, the ``Frame`` exposes common attributes of shape and size.
-
->>> frame.shape
-(5000, 5)
->>> frame.size
-25000
->>> frame.nbytes
-3320000
-
-
-Unlike a NumPy array, a Frame stores heterogeneous types, where each column is a single type. StaticFrame preserves the full range of NumPy types, including fixed-size character strings. Character strings can be converted to Python objects or other types as needed with the ``Frame.astype`` interface, which exposes a ``__getitem__`` style interface for selecting columns to convert. As with all similar functions, a new ``Frame`` is returned.
-
->>> frame.dtypes
-<Series>
-<Index>
-albumId      int64
-id           int64
-title        <U86
-url          <U38
-thumbnailUrl <U38
-<<U12>       <object>
-
->>> frame.astype['title':](object).dtypes
-<Series>
-<Index>
-albumId      int64
-id           int64
-title        object
-url          object
-thumbnailUrl object
-<<U12>       <object>
-
-
-Utility functions common to Pandas users are available on ``Frame`` and ``Series``, such as ``Series.unique()``, ``Series.isna()``, and ``Series.any()``.
-
->>> frame['albumId'].unique().tolist()
-[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
->>> frame['id'].isna().any()
-False
-
-.. note::
-
-    For more information on Frame utility functions, see `Frame: Method <https://static-frame.readthedocs.io/en/latest/api_detail/frame.html#frame-method>`_.
-
-StaticFrame interfaces for extracting data will be familiar to Pandas users, though with a number of interface refinements to remove redundancies and increase consistency. On a ``Frame``, ``__getitem__`` is (exclusively) a column selector; ``loc`` and ``iloc`` are (with one argument) row selectors or (with two arguments) row and column selectors.
-
-For example we can select a single column with ``__getitem__``:
-
->>> frame['albumId'].tail()
-<Series: albumId>
-<Index>
-4995              100
-4996              100
-4997              100
-4998              100
-4999              100
-<int64>           <int64>
-
-
-Consistent with other ``__getitem__`` style selectors, a slice or a list can be used to select columns:
-
->>> frame['id':'title'].head()
-<Frame>
-<Index> id      title                <<U12>
-<Index>
-0       1       accusamus beatae ...
-1       2       reprehenderit est...
-2       3       officia porro iur...
-3       4       culpa odio esse r...
-4       5       natus nisi omnis ...
-<int64> <int64> <<U86>
-
-
-The ``loc`` interface, with one argument, returns a ``Series`` for the row found at the given index label.
-
->>> frame.loc[4]
-<Series: 4>
-<Index>
-albumId      1
-id           5
-title        natus nisi omnis ...
-url          https://via.place...
-thumbnailUrl https://via.place...
-<<U12>       <object>
-
-
-With two arguments, ``loc`` can select both rows and columns at the same time:
-
->>> frame.loc[4:8, ['albumId', 'title']]
-<Frame>
-<Index> albumId title                <<U12>
-<Index>
-4       1       natus nisi omnis ...
-5       1       accusamus ea aliq...
-6       1       officia delectus ...
-7       1       aut porro officii...
-8       1       qui eius qui aute...
-<int64> <int64> <<U86>
-
-
-Where the ``loc`` interface uses index and column labels, the ``iloc`` interface uses integer offsets from zero, just as if the ``Frame`` were a NumPy array. For example, we can select the last row with ``-1``:
-
->>> frame.iloc[-1]
-<Series: 4999>
-<Index>
-albumId        100
-id             5000
-title          error quasi sunt ...
-url            https://via.place...
-thumbnailUrl   https://via.place...
-<<U12>         <object>
-
-
-Or, using two arguments, we can select the first two columns of the last two rows:
-
->>> frame.iloc[-2:, 0:2]
-<Frame>
-<Index> albumId id      <<U12>
-<Index>
-4998    100     4999
-4999    100     5000
-<int64> <int64> <int64>
-
-
-.. As providing both axis arguments at the same time is always more efficient than sequential selections, StaticFrame provides a selection wrapper, ``ILoc``, which permits including an ``iloc``-style seleciton in a ``loc`` selection:
-.. Example here fails!
-.. frame.loc[sf.ILoc[-1], ['id', 'title', 'url']]
-
-
-
-Just as with Pandas, expressions can be used in ``__getitem__``, ``loc``, and ``iloc`` statements to create more narrow selections. For example, we can select all "albumId" greater than or equal to 98.
-
->>> frame.loc[frame['albumId'] >= 98, ['albumId', 'title']].head()
-<Frame>
-<Index> albumId title                <<U12>
-<Index>
-4850    98      aut aut nulla vol...
-4851    98      ducimus neque del...
-4852    98      fugit officiis su...
-4853    98      pariatur temporib...
-4854    98      qui inventore inc...
-<int64> <int64> <<U86>
-
-
-However, unlike Pandas, ``__getitem__``, ``loc``, and ``iloc`` cannot be used for assignment or in-place mutation on a ``Frame`` or ``Series``. Throughout StaticFrame, all underlying NumPy arrays, and all container attributes, are immutable. Making data and objects immutable reduces opportunities for coding errors and offers, in some situations, greater efficiency by avoiding defensive copies.
-
->>> frame.loc[4854, 'albumId']
-98
->>> frame.loc[4854, 'albumId'] = 200
-Traceback (most recent call last):
-TypeError: 'InterfaceGetItem' object does not support item assignment
->>> frame.values[4854, 0] = 200
-Traceback (most recent call last):
-ValueError: assignment destination is read-only
-
-
-.. note::
-
-    For more information on Frame selection interfaces, see `Frame: Selector <https://static-frame.readthedocs.io/en/latest/api_detail/frame.html#frame-selector>`_.
-
-
-Instead of in-place assignment, an ``assign`` interface object (similar to the ``Frame.astype`` interface shown above) is provided to expose ``__getitem__``, ``loc``, and ``iloc`` interfaces that, when called with an argument, return a new object with the desired changes. These interfaces expose the full range of expressive assignment-like idioms found in Pandas and NumPy. Arguments can be single values, or ``Series`` and ``Frame`` objects, where assignment will align on the Index.
-
->>> frame_new = frame.assign.loc[4854, 'albumId'](200)
->>> frame_new.loc[4854, 'albumId']
-200
-
-
-This pattern of specialized interfaces is used throughout StaticFrame, such as with the ``Frame.mask`` and ``Frame.drop`` interfaces. For example, ``Frame.mask`` can be used to create a Boolean ``Frame`` that sets rows to True if their "id" is even:
-
->>> frame.mask.loc[frame['id'] % 2 == 0].head()
-<Frame>
-<Index> albumId id     title  url    thumbnailUrl <<U12>
-<Index>
-0       False   False  False  False  False
-1       True    True   True   True   True
-2       False   False  False  False  False
-3       True    True   True   True   True
-4       False   False  False  False  False
-<int64> <bool>  <bool> <bool> <bool> <bool>
-
-
-
-Or, using the ``Frame.drop`` interface, a new ``Frame`` can be created by dropping rows with even "id" values and dropping URL columns specified in a list:
-
->>> frame.drop.loc[frame['id'] % 2 == 0, ['thumbnailUrl', 'url']].head()
-<Frame>
-<Index> albumId id      title                <<U12>
-<Index>
-0       1       1       accusamus beatae ...
-2       1       3       officia porro iur...
-4       1       5       natus nisi omnis ...
-6       1       7       officia delectus ...
-8       1       9       qui eius qui aute...
-<int64> <int64> <int64> <<U86>
-
-
-Iteration of rows, columns, and elements, as well as function application on those values, is unified under a family of generator interfaces. These interfaces are distinguished by the form of the data iterated (``Series``, ``namedtuple``, or ``array``) and whether key-value pairs (e.g., ``Frame.iter_series_items()``) or just values (e.g., ``Frame.iter_series()``) are yielded. For example, we can iterate over each row of a ``Frame`` and yield a corresponding ``Series``:
-
->>> next(iter(frame.iter_series(axis=1)))
-<Series: 0>
-<Index>
-albumId      1
-id           1
-title        accusamus beatae ...
-url          https://via.place...
-thumbnailUrl https://via.place...
-<<U12>       <object>
-
-Or we can iterate over rows as named tuples, applying a function that matches a substring of the "title" or returns None, then drop those None records:
-
->>> frame.iter_tuple(axis=1).apply(lambda r: r.title if 'voluptatem' in r.title else None).dropna().head()
-<Series>
-<Index>
-19       assumenda volupta...
-27       non neque eligend...
-29       odio enim volupta...
-31       ad enim dignissim...
-40       in voluptatem dol...
-<int64>  <object>
-
-
-Element iteration and function application works the same way as for rows or columns (though without an ``axis`` argument). For example, here each URL is processed with the same string transformation function:
-
->>> frame[['thumbnailUrl', 'url']].iter_element().apply(lambda c: c.replace('https://', '')).iloc[-4:]
-<Frame>
-<Index> thumbnailUrl         url                  <<U12>
-<Index>
-4996    via.placeholder.c... via.placeholder.c...
-4997    via.placeholder.c... via.placeholder.c...
-4998    via.placeholder.c... via.placeholder.c...
-4999    via.placeholder.c... via.placeholder.c...
-<int64> <<U30>               <<U30>
-
-
-Group-by functionality is exposed in a similar manner with ``Frame.iter_group_items()`` and ``Frame.iter_group()``.
-
->>> next(iter(frame.iter_group('albumId', axis=0))).shape
-(50, 5)
-
-
-Function application to a group ``Frame`` can be used to produce a ``Series`` indexed by the group label. For example, a ``Series``, indexed by "albumId", can be produced to show the number of unique titles found per album.
-
->>> frame.iter_group('albumId', axis=0).apply(lambda g: len(g['title'].unique()), dtype=np.int64).head()
-<Series>
-<Index: albumId>
-1                50
-2                50
-3                50
-4                50
-5                50
-<int64>          <int64>
-
-.. note::
-
-    For more information on Frame iterators and tools for function application, see `Frame: Iterator <https://static-frame.readthedocs.io/en/latest/api_detail/frame.html#frame-iterator>`_.
-
-If performing calculations on a ``Frame`` that result in a ``Series`` with a compatible ``Index``, a grow-only ``FrameGO`` can be used to add ``Series`` as new columns. This limited form of mutation, i.e., only the addition of columns, provides a convenient compromise between mutability and immutability. (Underlying NumPy array data always remains immutable.)
-
-A ``FrameGO`` can be efficiently created from a ``Frame``, as underling NumPy arrays do not have to be copied:
-
->>> frame_go = frame.to_frame_go()
-
-
-We can obtain a track number within each album, assuming the records are sorted, by creating the following generator expression pipe-line. Using a ``Frame`` grouped by "albumId", ``zip`` together as pairs the ``Frame.index`` and a contiguous integer sequence via ``range()``; ``chain`` all of those iterables, and then pass the resulting generator to ``Series.from_items()``. (As much as possible, StaticFrame supports generators as arguments wherever an ordered sequence is expected.)
-
->>> from itertools import chain
->>> index_to_track = chain.from_iterable(zip(g.index, range(len(g))) for g in frame_go.iter_group('albumId'))
->>> frame_go['track'] = sf.Series.from_items(index_to_track, dtype=np.int64) + 1
-
->>> frame_go.iloc[45:55]
-<FrameGO>
-<IndexGO> albumId id      title                url                  thumbnailUrl         track   <<U12>
-<Index>
-45        1       46      quidem maiores in... https://via.place... https://via.place... 46
-46        1       47      et soluta est        https://via.place... https://via.place... 47
-47        1       48      ut esse id           https://via.place... https://via.place... 48
-48        1       49      quasi quae est mo... https://via.place... https://via.place... 49
-49        1       50      et inventore quae... https://via.place... https://via.place... 50
-50        2       51      non sunt voluptat... https://via.place... https://via.place... 1
-51        2       52      eveniet pariatur ... https://via.place... https://via.place... 2
-52        2       53      soluta et harum a... https://via.place... https://via.place... 3
-53        2       54      ut ex quibusdam d... https://via.place... https://via.place... 4
-54        2       55      voluptatem conseq... https://via.place... https://via.place... 5
-<int64>   <int64> <int64> <<U86>               <<U38>               <<U38>               <int64>
-
-
-Unlike with Pandas, StaticFrame ``Index`` objects always enforce uniqueness (there is no "verify_integrity" option: integrity is never optional). Thus, an index can never be set from non-unique data:
-
->>> frame_go.set_index('albumId')
-Traceback (most recent call last):
-static_frame.core.exception.ErrorInitIndexNonUnique: Labels have 4900 non-unique values, including 1, 2, 3, 4, 5, 6, 7, 8, 9, 10.
-
-
-For a data set such as the one used in this example, a hierarchical index, by "albumId" and "track", is practical. StaticFrame implements hierarchical indices as ``IndexHierarchy`` objects. The ``Frame.set_index_hierarchy()`` method, given columns in a ``Frame``, can be used to create a hierarchical index:
-
-
->>> frame_h = frame_go.set_index_hierarchy(['albumId', 'track'], drop=True)
->>> frame_h.head()
-<FrameGO>
-<IndexGO>                                    id      title                url                  thumbnailUrl         <<U12>
-<IndexHierarchy: ('albumId', 'tra...
-1                                    1       1       accusamus beatae ... https://via.place... https://via.place...
-1                                    2       2       reprehenderit est... https://via.place... https://via.place...
-1                                    3       3       officia porro iur... https://via.place... https://via.place...
-1                                    4       4       culpa odio esse r... https://via.place... https://via.place...
-1                                    5       5       natus nisi omnis ... https://via.place... https://via.place...
-<int64>                              <int64> <int64> <<U86>               <<U38>               <<U38>
-
-
-
-
-Hierarchical indices permit specifying selectors, per axis, at each hierarchical level. To distinguish hierarchical levels from axis arguments in a ``loc`` expression, the ``HLoc`` wrapper, exposing a ``__getitem__`` interface, can be used. For example, we can select, from all albums, the second and fifth track, and then only the "title" and "url" columns.
-
->>> frame_h.loc[sf.HLoc[:, [2,5]], ['title', 'url']].head()
-<FrameGO>
-<IndexGO>                                    title                url                  <<U12>
-<IndexHierarchy: ('albumId', 'tra...
-1                                    2       reprehenderit est... https://via.place...
-1                                    5       natus nisi omnis ... https://via.place...
-2                                    2       eveniet pariatur ... https://via.place...
-2                                    5       voluptatem conseq... https://via.place...
-3                                    2       eaque iste corpor... https://via.place...
-<int64>                              <int64> <<U86>               <<U38>
-
-
-
-Just as a hierarchical selection can reside in a ``loc`` expression with an ``HLoc`` wrapper, an integer index selection can reside in a ``loc`` expression with an ``ILoc`` wrapper. For example, the previous row selection is combined with the selection of the last column:
-
->>> frame_h.loc[sf.HLoc[:, [2,5]], sf.ILoc[-1]].head()
-<Series: thumbnailUrl>
-<IndexHierarchy: ('albumId', 'tra...
-1                                    2       https://via.place...
-1                                    5       https://via.place...
-2                                    2       https://via.place...
-2                                    5       https://via.place...
-3                                    2       https://via.place...
-<int64>                              <int64> <<U38>
-
-
-
-.. note::
-
-    For more information on IndexHierarchy, see `Index Hierarchy <https://static-frame.readthedocs.io/en/latest/api_detail/index_hierarchy.html>`_.
-
-While StaticFrame offers many of the features of Pandas and similar data structures, exporting directly to NumPy arrays (via the ``.values`` attribute) or to Pandas is supported for functionality not found in StaticFrame or compatibility with other libraries. For example, a ``Frame`` can export to a Pandas ``DataFrame`` with ``Frame.to_pandas()``.
-
->>> df = frame_go.to_pandas()
+- pandas>=1.1.5
+- xlsxwriter>=1.1.2
+- openpyxl>=3.0.9
+- xarray>=0.13.0
+- pyarrow>=3.0.0
+- visidata>=2.4
+
+
+StaticFrame 5
+---------------------------------------------------------------
+
+*Make it work, make it right, make it fast*: after years of making it right, StaticFrame 5 makes it fast.
+
+With further integration of performance-critical routines in C (provided by `ArrayKit <https://github.com/static-frame/arraykit>`__ ), many more operations in StaticFrame now outperform Pandas, all while preserving StaticFrame's immutable data model and its consistent, explicit interfaces.
+
+The table below shows representative speed-ups measured on Python 3.14, NumPy 2.4, and Pandas 3.0.5. Examples are reproducible with the self-contained benchmarks that follow. Note that performance results can be highly variable based on specific data shapes and types, and any claim of "always faster" is dubious.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 47 15
+
+   * - Operation
+     - StaticFrame interface
+     - Speed-up
+   * - Rename axis
+     - ``Frame.rename(...)``
+     - ~70×
+   * - Concatenate (axis 1)
+     - ``Frame.from_concat(...)``
+     - ~30×
+   * - Row-wise function application
+     - ``Frame.iter_tuple(axis=1).apply(...)``
+     - ~15×
+   * - Select columns
+     - ``Frame[[...]]``
+     - ~13×
+   * - Set index
+     - ``Frame.set_index(...)``
+     - ~9×
+   * - Ranking (with ties)
+     - ``Series.rank_mean(...)``
+     - ~6×
+   * - Group-by reduction
+     - ``Frame.iter_group(...).reduce.from_label_map(...)``
+     - ~2×
+   * - Pivot table
+     - ``Frame.pivot(...)``
+     - ~1.7×
+   * - Join (unique key)
+     - ``Frame.join_left(...)``
+     - ~1.2×
+
+
+All examples build their data with `frame_fixtures <https://github.com/static-frame/frame-fixtures>`__ (imported as ``ff``), and use ``compare()`` to time StaticFrame against an equivalent Pandas call:
+
+.. code-block:: python
+
+    >>> import numpy as np
+    >>> import pandas as pd
+    >>> import timeit
+    >>> import static_frame as sf
+    >>> import frame_fixtures as ff
+
+    >>> def compare(label, sf_call, pd_call, *, number):
+    ...    sf_call(); pd_call()  # warm-up
+    ...    st = timeit.timeit(sf_call, number=number) / number
+    ...    pt = timeit.timeit(pd_call, number=number) / number
+    ...    scale, unit = (1e6, 'µs') if min(st, pt) < 1e-3 else (1e3, 'ms')
+    ...    print(f'{label:16} StaticFrame {st*scale:7.1f} {unit} | Pandas {pt*scale:7.1f} {unit} | {pt / st:.1f}x')
+
+No-Copy Operations on Immutable Data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Because all StaticFrame data is immutable, arrays can be safely shared between containers without defensive copies or complicated copy-on-write (CoW) management. Structural operations (relabeling, selecting columns, setting an index, concatenating) reuse the same underlying NumPy arrays and are often an order of magnitude (or more) faster than Pandas.
+
+.. code-block:: python
+
+    >>> f1 = ff.parse('s(10_000,1000)|v(int,int,str,float)')
+    >>> f2 = ff.parse('s(10_000,1000)|v(int,bool,bool,float)')
+    >>> df1, df2 = f1.to_pandas(), f2.to_pandas()
+    >>> compare('rename', lambda: f1.rename(index='foo'), lambda: df1.rename_axis('foo'), number=10000)
+    rename           StaticFrame     8.2 µs | Pandas   567.0 µs | 68.8x
+    >>> compare('set index', lambda: f1.set_index(0), lambda: df1.set_index(0, drop=False), number=2000)
+    set index        StaticFrame    64.7 µs | Pandas   596.1 µs | 9.2x
+    >>> compare('select columns', lambda: f1[[10, 50, 100, 500]], lambda: df1[[10, 50, 100, 500]], number=10000)
+    select columns   StaticFrame     5.5 µs | Pandas    69.0 µs | 12.6x
+    >>> compare('concat (axis 1)', lambda: sf.Frame.from_concat((f1, f2), axis=1, columns=sf.IndexAutoFactory), lambda: pd.concat((df1, df2), axis=1), number=2000)
+    concat (axis 1)  StaticFrame    62.3 µs | Pandas  1781.9 µs | 28.6x
+
+
+Faster Computation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Version 5 extends this performance to commonly used group-by, reduce, pivot, join and related operations. A single one-million-row fixture serves these examples:
+
+.. code-block:: python
+
+    >>> f = (ff.parse('s(1_000_000,5)|v(int,int,float,float,float)').relabel(columns=('key', 'r', 'x', 'y', 'z')).assign['key'].apply(lambda s: 'g' + (s % 1000).astype('U4')).assign['r'].apply(lambda s: s % 100_000))
+    >>> df = f.to_pandas()
+    >>> compare('group-by', lambda: f.iter_group('key').reduce.from_label_map({'x': np.sum, 'y': np.sum}).to_frame(), lambda: df.groupby('key')[['x', 'y']].sum(), number=10)
+    group-by         StaticFrame    11.7 ms | Pandas    23.7 ms | 2.0x
+    >>> compare('reduce', lambda: f.iter_group('key').reduce.from_label_map({'x': np.sum, 'y': np.max}).to_frame(), lambda: df.groupby('key').agg({'x': 'sum', 'y': 'max'}), number=10)
+    reduce           StaticFrame    11.6 ms | Pandas    23.8 ms | 2.0x
+    >>> compare('pivot', lambda: f.pivot('key', data_fields='x', func=np.sum), lambda: df.pivot_table(index='key', values='x', aggfunc='sum'), number=10)
+    pivot            StaticFrame    13.2 ms | Pandas    22.7 ms | 1.7x
+    >>> compare('rank', lambda: f['r'].rank_mean(), lambda: df['r'].rank(method='average'), number=20)
+    rank             StaticFrame    18.5 ms | Pandas   108.5 ms | 5.9x
+    >>> compare('row-apply', lambda: f.iter_tuple(axis=1).apply(lambda t: t.x * 2 + t.y - t.z), lambda: df.apply(lambda t: t.x * 2 + t.y - t.z, axis=1), number=5)
+    row-apply        StaticFrame   485.8 ms | Pandas  5348.0 ms | 11.0x
+
+For join, two frames are built sharing the same 500,000 integer keys, relabeled as strings:
+
+.. code-block:: python
+
+    >>> left = ff.parse('s(500_000,1)|v(float)|i(I,int)').relabel(columns=('lv',))
+    >>> right = ff.parse('s(500_000,1)|v(float)|i(I,int)').relabel(columns=('rv',))
+    >>> keys = 'k' + left.index.values.astype('U12')
+    >>> sf_left = left.relabel(index=keys).sort_index()
+    >>> sf_right = right.relabel(index=keys)
+    >>> df_left, df_right = sf_left.to_pandas(), sf_right.to_pandas()
+    >>> compare('join', lambda: sf_left.join_left(sf_right, left_depth_level=0, right_depth_level=0), lambda: df_left.join(df_right, how='left'), number=10)
+    join             StaticFrame    35.7 ms | Pandas    42.1 ms | 1.2x
+
+For the complete performance suite (dozens of comparisons across construction, selection, iteration, grouping, and reduction) run ``python -m static_frame.profile --performance "*"``.

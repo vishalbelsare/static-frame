@@ -1,14 +1,13 @@
 
 
 import os
-import typing as tp
 
 import numpy as np
+import typing_extensions as tp
 
 import static_frame as sf
+from static_frame.core.util import TLabel
 from static_frame.test.test_case import Timer
-
-
 
 # def func_b(frame: Frame) -> Frame:
 #     for row in frame.iter_series():
@@ -63,7 +62,7 @@ from static_frame.test.test_case import Timer
 
 def bus_batch_streaming() -> None:
 
-    TypeIterFrameItems = tp.Iterator[tp.Tuple[tp.Hashable, sf.Frame]]
+    TypeIterFrameItems = tp.Iterator[tp.Tuple[TLabel, sf.Frame]]
 
     # do a bunch of processing on large Frames while maintaining single frame overhead
 
@@ -72,8 +71,8 @@ def bus_batch_streaming() -> None:
             f = sf.Frame(np.arange(100000).reshape(1000, 100) * i, name=label)
             yield label, f
 
-    # a StoreConfig is bundle of read/write config in a single object
-    config = sf.StoreConfig(include_index=True,
+    # a StoreConfigBase is bundle of read/write config in a single object
+    config = sf.StoreConfigParquet(include_index=True,
             include_columns=True,
             index_depth=1,
             columns_depth=1)
@@ -97,7 +96,7 @@ def bus_batch_streaming() -> None:
 
     # a function that reads through the derived data and produces single in-memory result
     def derive_characteristic(bus: sf.Bus) -> sf.Series:
-        def gen() -> tp.Iterator[tp.Tuple[tp.Hashable, float]]:
+        def gen() -> tp.Iterator[tp.Tuple[TLabel, float]]:
             for label in bus.keys():
                 f = bus[label]
                 yield label, f.mean().mean()
@@ -129,7 +128,7 @@ def bus_batch_streaming() -> None:
             yield label, f_post
 
     def derive_characteristic_alt(items: TypeIterFrameItems) -> sf.Series:
-        def gen() -> tp.Iterator[tp.Tuple[tp.Hashable, float]]:
+        def gen() -> tp.Iterator[tp.Tuple[TLabel, float]]:
             for label, f in items:
                 yield label, f.mean().mean()
         return sf.Series.from_items(gen())
@@ -161,7 +160,7 @@ def bus_batch_demo() -> None:
     # https://www.ndbc.noaa.gov/view_text_file.php?filename=46222h2018.txt.gz&dir=data/historical/stdmet/
 
 
-    # multi-table storage: XLSX, HDF5, SQLite, zipped bundles
+    # multi-table storage: XLSX, SQLite, zipped bundles
     # how can we easily read, write, and process these
 
     # Batch and the Bus: two series-like containers of Frames
@@ -348,8 +347,9 @@ def bus_batch_demo() -> None:
 
 
 def bus_aggregate() -> None:
-    import frame_fixtures as ff
     from itertools import zip_longest
+
+    import frame_fixtures as ff
 
     # create the "total index"
     index = sf.IndexDate.from_date_range('2019-01-12', '2019-12-31')
@@ -417,7 +417,7 @@ def bus_aggregate() -> None:
 def main() -> None:
     fp = '/home/ariza/Downloads/archive.zip'
 
-    config = sf.StoreConfig(index_depth=0, label_decoder=int, label_encoder=str)
+    config = sf.StoreConfigCSV(index_depth=0, label_decoder=int, label_encoder=str)
 
     bus = sf.Bus.from_zip_csv(fp, config=config)
 
@@ -458,7 +458,6 @@ def tables() -> None:
     name = 'Constructors & Exporters'
     columns = ('Constructor', 'Exporter') #type: ignore
     records = (
-        ('from_hdf5',  'to_hdf5'),
         ('from_sqlite',  'to_sqlite'),
         ('from_zip_csv', 'to_zip_csv',),
         ('from_zip_npz', 'to_zip_npz',),

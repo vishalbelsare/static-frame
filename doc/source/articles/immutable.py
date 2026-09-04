@@ -32,10 +32,12 @@ Native immutable data structures
 '''
 from dataclasses import dataclass
 
-import typing as tp
 import numpy as np
-import static_frame as sf
 import pandas as pd
+import typing_extensions as tp
+
+import static_frame as sf
+
 # 'data'[2] = 20
 frozenset
 

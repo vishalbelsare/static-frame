@@ -1,47 +1,35 @@
-import typing as tp
+from __future__ import annotations
 
+import typing_extensions as tp
 
-from static_frame.core.util import GetItemKeyType
-from static_frame.core.util import KEY_MULTIPLE_TYPES
-from static_frame.core.util import NULL_SLICE
+from static_frame.core.util import EMPTY_TUPLE, TLocSelector, key_to_str
 
 
 class HLocMeta(type):
-
-    def __getitem__(cls,
-            key: GetItemKeyType
-            ) -> 'HLoc':
-        if not isinstance(key, tuple):
+    def __getitem__(cls, key: TLocSelector) -> 'HLoc':
+        if not isinstance(key, tuple) or key is EMPTY_TUPLE:
             key = (key,)
-        return cls(key) #type: ignore [no-any-return]
+        return cls(key)  # type: ignore [no-any-return]
+
 
 class HLoc(metaclass=HLocMeta):
-    '''A wrapper for embedding hierarchical specificiations for :obj:`static_frame.IndexHierarchy` within a single axis argument of a ``loc`` selection.
+    """
+    A simple wrapper for embedding hierarchical specifications for :obj:`static_frame.IndexHierarchy` within a single axis argument of a ``loc`` selection.
 
-    Implemented as a container of hiearchical keys that defiines NULL slices for all lower dimensions that are not defined at construction.
-    '''
+    Implemented as a container of hierarchical keys that defines NULL slices for all lower dimensions that are not defined at construction.
+    """
 
     STATIC = True
-    __slots__ = (
-            'key',
-            )
+    __slots__ = ('key',)
 
-    def __init__(self, key: tp.Sequence[GetItemKeyType]):
+    def __init__(self, key: tp.Tuple[TLocSelector]) -> None:
         self.key = key
 
-    def __iter__(self) -> tp.Iterator[GetItemKeyType]:
+    def __iter__(self) -> tp.Iterator[TLocSelector]:
         return self.key.__iter__()
 
     def __len__(self) -> int:
         return self.key.__len__()
 
-    def __getitem__(self, key: int) -> GetItemKeyType:
-        '''
-        Each key represents a hierarchical level; if a key is not specified, the default should be to return the null slice.
-        '''
-        if key >= len(self.key):
-            return NULL_SLICE
-        return self.key.__getitem__(key)
-
-    def has_key_multiple(self) -> bool:
-        return any(isinstance(k, KEY_MULTIPLE_TYPES) for k in self.key)
+    def __repr__(self) -> str:
+        return f'<HLoc[{",".join(map(key_to_str, self.key))}]>'

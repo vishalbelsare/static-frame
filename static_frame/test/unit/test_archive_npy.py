@@ -1,30 +1,42 @@
+from __future__ import annotations
+
+import contextlib
 import os
+
+# import typing_extensions as tp
+import zipfile
+from io import StringIO, UnsupportedOperation
 from tempfile import TemporaryDirectory
-from io import UnsupportedOperation
 
-import numpy as np
-from numpy.lib.format import write_array # type: ignore
 import frame_fixtures as ff
+import numpy as np
+from numpy.lib.format import write_array
 
+from static_frame.core.archive_npy import (
+    NPY,
+    NPZ,
+    ArchiveDirectory,
+    ArchiveManifest,
+    ArchiveZip,
+    ArchiveZipWrapper,
+    NPYConverter,
+)
+from static_frame.core.bus import Bus
+from static_frame.core.exception import AxisInvalid, ErrorNPYDecode, ErrorNPYEncode
 from static_frame.core.frame import Frame
 from static_frame.core.index import Index
-from static_frame.core.archive_npy import NPYConverter
-from static_frame.core.archive_npy import ArchiveDirectory
-from static_frame.core.archive_npy import ArchiveZip
-from static_frame.core.archive_npy import NPZ
-from static_frame.core.archive_npy import NPY
-
-from static_frame.core.exception import ErrorNPYDecode
-from static_frame.core.exception import ErrorNPYEncode
-from static_frame.core.exception import AxisInvalid
-
-from static_frame.test.test_case import temp_file
-from static_frame.test.test_case import TestCase
+from static_frame.core.metadata import NPYLabel
+from static_frame.core.store_config import (
+    StoreConfigNPY,
+    StoreConfigNPZ,
+    StoreConfigPickle,
+)
+from static_frame.core.yarn import Yarn
+from static_frame.test.test_case import TestCase, temp_file
 
 
 class TestUnit(TestCase):
-
-    #---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     def test_to_npy_a(self) -> None:
         a1 = np.arange(20)
 
@@ -51,7 +63,7 @@ class TestUnit(TestCase):
                     NPYConverter.to_npy(f, a1)
 
     def test_to_npy_d(self) -> None:
-        a1 = np.arange(12).reshape(2,6).T
+        a1 = np.arange(12).reshape(2, 6).T
 
         with temp_file('.npy') as fp:
             with open(fp, 'wb') as f:
@@ -64,7 +76,6 @@ class TestUnit(TestCase):
     def test_to_npy_e(self) -> None:
         a1 = np.arange(4)
         with temp_file('.npy') as fp:
-
             with open(fp, 'wb') as f:
                 NPYConverter.to_npy(f, a1)
             # ensure compatibility with numpy loaders
@@ -72,9 +83,10 @@ class TestUnit(TestCase):
             self.assertTrue((a1 == a2).all())
 
     def test_to_npy_f(self) -> None:
-        a1 = np.array([('Rex', 9, 81.0), ('Fido', 3, 27.0)],
-                dtype=[('name', 'U10'), ('age', 'i4'), ('weight', 'f4')]
-                )
+        a1 = np.array(
+            [('Rex', 9, 81.0), ('Fido', 3, 27.0)],
+            dtype=[('name', 'U10'), ('age', 'i4'), ('weight', 'f4')],
+        )
         with temp_file('.npy') as fp:
             with open(fp, 'wb') as f:
                 with self.assertRaises(ErrorNPYEncode):
@@ -110,43 +122,43 @@ class TestUnit(TestCase):
             with open(fp, 'rb') as f:
                 # invaliud header raises
                 with self.assertRaises(ErrorNPYDecode):
-                    a2, _ = NPYConverter.from_npy(f, {})
+                    _ = NPYConverter.from_npy(f, {})
 
     def test_from_npy_d(self) -> None:
         a1 = np.arange(12).reshape(2, 3, 2)
 
         with temp_file('.npy') as fp:
             with open(fp, 'wb') as f:
-                write_array(f, a1, version=(1, 0))
+                write_array(f, a1, version=(1, 0))  # type: ignore
 
             with open(fp, 'rb') as f:
                 # invalid shape
                 with self.assertRaises(ErrorNPYDecode):
-                    a2, _ = NPYConverter.from_npy(f, {})
+                    _ = NPYConverter.from_npy(f, {})
 
     def test_from_npy_e(self) -> None:
         a1 = np.array([2, 3, 4])
 
         with temp_file('.npy') as fp:
             with open(fp, 'wb') as f:
-                write_array(f, a1, version=(3, 0))
+                write_array(f, a1, version=(3, 0))  # type: ignore
 
             with open(fp, 'rb') as f:
                 # invlid header; only version 1,0 is supported
                 with self.assertRaises(ErrorNPYDecode):
-                    a2, _ = NPYConverter.from_npy(f, {})
+                    _ = NPYConverter.from_npy(f, {})
 
     def test_from_npy_f(self) -> None:
         a1 = np.array([None, 'foo', 3], dtype=object)
 
         with temp_file('.npy') as fp:
             with open(fp, 'wb') as f:
-                write_array(f, a1, version=(1, 0))
+                write_array(f, a1, version=(1, 0))  # type: ignore
 
             with open(fp, 'rb') as f:
                 # invalid object dtype
                 with self.assertRaises(ErrorNPYDecode):
-                    a2, _ = NPYConverter.from_npy(f, {})
+                    _ = NPYConverter.from_npy(f, {})
 
     def test_from_npy_g(self) -> None:
         a1 = np.array([2, 3, 4])
@@ -166,9 +178,9 @@ class TestUnit(TestCase):
             with open(fp, 'rb') as f:
                 # invaliud header raises
                 with self.assertRaises(ErrorNPYDecode):
-                    a2, _ = NPYConverter.header_from_npy(f, {})
+                    _ = NPYConverter.header_from_npy(f, {})
 
-    #---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 
     def test_archive_zip_a(self) -> None:
         with temp_file('.zip') as fp:
@@ -192,10 +204,12 @@ class TestUnit(TestCase):
             # reading from a non-existant directory
             with self.assertRaises(RuntimeError):
                 ad = ArchiveDirectory(fp, writeable=False, memory_map=False)
-            os.mkdir(fp) # restore the directory for context manager
+            os.mkdir(fp)  # restore the directory for context manager
 
     def test_archive_directory_d(self) -> None:
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
+
             a1 = np.arange(10)
             ad1 = ArchiveDirectory(fp, writeable=True, memory_map=False)
             ad1.write_array('a1.npy', a1)
@@ -204,21 +218,19 @@ class TestUnit(TestCase):
             a2 = ad2.read_array('a1.npy')
             self.assertTrue((a1 == a2).all())
 
-    #---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     def test_archive_components_npz_write_arrays_a(self) -> None:
         with temp_file('.zip') as fp:
-
             a1 = np.arange(12).reshape(3, 4)
             NPZ(fp, 'w').from_arrays(blocks=(a1,))
 
             f = Frame.from_npz(fp)
             self.assertEqual(f.values.tolist(), a1.tolist())
-            self.assertIs(f.index._map, None)
-            self.assertIs(f.columns._map, None)
+            self.assertIs(f.index._map, None)  # type: ignore
+            self.assertIs(f.columns._map, None)  # type: ignore
 
     def test_archive_components_npz_write_arrays_b(self) -> None:
         with temp_file('.zip') as fp:
-
             a1 = np.arange(12).reshape(3, 4)
             a2 = np.array([3, 4])
 
@@ -246,12 +258,12 @@ class TestUnit(TestCase):
             NPZ(fp, 'w').from_arrays(blocks=(a1, a2, a3), index=index, axis=1)
             f = Frame.from_npz(fp)
             self.assertIs(f.index.__class__, IndexYear)
-            self.assertEqual([dt.kind for dt in f.dtypes.values],
-                    ['i', 'i', 'i', 'i', 'U', 'b'])
+            self.assertEqual(
+                [dt.kind for dt in f.dtypes.values], ['i', 'i', 'i', 'i', 'U', 'b']
+            )
 
     def test_archive_components_npz_write_arrays_e(self) -> None:
         with temp_file('.zip') as fp:
-
             a1 = np.arange(12).reshape(3, 4)
             a2 = np.array([3, 4])
 
@@ -264,13 +276,11 @@ class TestUnit(TestCase):
         a3 = np.arange(8).reshape(2, 4)
 
         with temp_file('.zip') as fp:
-
             NPZ(fp, 'w').from_arrays(blocks=(a1, a2, a3), axis=0)
             f = Frame.from_npz(fp)
             self.assertEqual(f.shape, (6, 4))
 
     def test_archive_components_npz_write_arrays_g(self) -> None:
-
         a1 = np.arange(12).reshape(3, 4)
         a2 = np.array(['a', 'b', 'c'])
         a3 = np.array([True, False, True])
@@ -280,32 +290,48 @@ class TestUnit(TestCase):
             NPZ(fp, 'w').from_arrays(blocks=(a1, a2, a3), index=index, name='bar', axis=1)
 
             f = Frame.from_npz(fp)
-            self.assertEqual(f.to_pairs(),
-                    ((0, ((10, 0), (20, 4), (30, 8))), (1, ((10, 1), (20, 5), (30, 9))), (2, ((10, 2), (20, 6), (30, 10))), (3, ((10, 3), (20, 7), (30, 11))), (4, ((10, 'a'), (20, 'b'), (30, 'c'))), (5, ((10, True), (20, False), (30, True))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (0, ((10, 0), (20, 4), (30, 8))),
+                    (1, ((10, 1), (20, 5), (30, 9))),
+                    (2, ((10, 2), (20, 6), (30, 10))),
+                    (3, ((10, 3), (20, 7), (30, 11))),
+                    (4, ((10, 'a'), (20, 'b'), (30, 'c'))),
+                    (5, ((10, True), (20, False), (30, True))),
+                ),
+            )
             self.assertEqual(f.name, 'bar')
             self.assertEqual(f.index.name, 'foo')
 
     def test_archive_components_npz_write_arrays_h(self) -> None:
-
         a1 = np.arange(12).reshape(3, 4)
         a2 = np.array(['a', 'b', 'c'])
         a3 = np.array([True, False, True])
 
         with temp_file('.zip') as fp:
-            columns=Index(('a', 'b', 'c', 'd', 'e', 'f'), name='foo')
-            NPZ(fp, 'w').from_arrays(blocks=(a1, a2, a3), columns=columns, name='bar', axis=1)
+            columns = Index(('a', 'b', 'c', 'd', 'e', 'f'), name='foo')
+            NPZ(fp, 'w').from_arrays(
+                blocks=(a1, a2, a3), columns=columns, name='bar', axis=1
+            )
 
             f = Frame.from_npz(fp)
-            self.assertEqual(f.to_pairs(),
-                    (('a', ((0, 0), (1, 4), (2, 8))), ('b', ((0, 1), (1, 5), (2, 9))), ('c', ((0, 2), (1, 6), (2, 10))), ('d', ((0, 3), (1, 7), (2, 11))), ('e', ((0, 'a'), (1, 'b'), (2, 'c'))), ('f', ((0, True), (1, False), (2, True))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    ('a', ((0, 0), (1, 4), (2, 8))),
+                    ('b', ((0, 1), (1, 5), (2, 9))),
+                    ('c', ((0, 2), (1, 6), (2, 10))),
+                    ('d', ((0, 3), (1, 7), (2, 11))),
+                    ('e', ((0, 'a'), (1, 'b'), (2, 'c'))),
+                    ('f', ((0, True), (1, False), (2, True))),
+                ),
+            )
             self.assertEqual(f.name, 'bar')
             self.assertEqual(f.columns.name, 'foo')
 
     def test_archive_components_npz_write_arrays_i(self) -> None:
         with temp_file('.zip') as fp:
-
             a1 = np.arange(12).reshape(3, 4)
             a2 = np.array([3, 4, 5])
 
@@ -318,116 +344,164 @@ class TestUnit(TestCase):
             with self.assertRaises(RuntimeError):
                 NPZ(fp, 'foo').from_arrays(blocks=(a1,))
 
-    #-----------------------------------------------------------------------------
+    def test_archive_components_npz_write_arrays_k(self) -> None:
+        f1 = ff.parse('s(2,4)|v(int,str,bool,bool)')
+
+        with temp_file('.zip') as fp:
+            f1.to_npz(fp)
+            a1 = np.arange(12).reshape(3, 4)
+            with self.assertRaises(UnsupportedOperation):
+                NPZ(fp, 'r').from_arrays(blocks=(a1,))
+
+    # ---------------------------------------------------------------------------
 
     def test_archive_components_npy_write_arrays_h(self) -> None:
-
         a1 = np.arange(12).reshape(3, 4)
         a2 = np.array(['a', 'b', 'c'])
         a3 = np.array([True, False, True])
 
         with TemporaryDirectory() as fp:
-            columns=Index(('a', 'b', 'c', 'd', 'e', 'f'), name='foo')
-            NPY(fp, 'w').from_arrays(blocks=(a1, a2, a3), columns=columns, name='bar', axis=1)
+            os.rmdir(fp)  # let it be re-created
+
+            columns = Index(('a', 'b', 'c', 'd', 'e', 'f'), name='foo')
+            NPY(fp, 'w').from_arrays(
+                blocks=(a1, a2, a3), columns=columns, name='bar', axis=1
+            )
 
             f = Frame.from_npy(fp)
-            self.assertEqual(f.to_pairs(),
-                    (('a', ((0, 0), (1, 4), (2, 8))), ('b', ((0, 1), (1, 5), (2, 9))), ('c', ((0, 2), (1, 6), (2, 10))), ('d', ((0, 3), (1, 7), (2, 11))), ('e', ((0, 'a'), (1, 'b'), (2, 'c'))), ('f', ((0, True), (1, False), (2, True))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    ('a', ((0, 0), (1, 4), (2, 8))),
+                    ('b', ((0, 1), (1, 5), (2, 9))),
+                    ('c', ((0, 2), (1, 6), (2, 10))),
+                    ('d', ((0, 3), (1, 7), (2, 11))),
+                    ('e', ((0, 'a'), (1, 'b'), (2, 'c'))),
+                    ('f', ((0, True), (1, False), (2, True))),
+                ),
+            )
             self.assertEqual(f.name, 'bar')
             self.assertEqual(f.columns.name, 'foo')
 
     def test_archive_components_npy_write_arrays_i(self) -> None:
-
         a1 = np.arange(12).reshape(3, 4)
         a2 = np.array(['a', 'b', 'c'])
         a3 = np.array([True, False, True])
 
         with TemporaryDirectory() as fp:
-            columns=('a', 'b', 'c', 'd', 'e', 'f')
+            os.rmdir(fp)  # let it be re-created
+            columns = ('a', 'b', 'c', 'd', 'e', 'f')
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_arrays(blocks=(a1, a2, a3), columns=columns, name='bar')
 
     def test_archive_components_npy_write_arrays_j(self) -> None:
-
         a1 = np.arange(12).reshape(3, 4)
         a2 = np.array(['a', 'b', 'c'])
         a3 = np.array([True, False, True])
 
         with TemporaryDirectory() as fp:
-            columns=np.arange(6).astype('datetime64[D]')
-            NPY(fp, 'w').from_arrays(blocks=(a1, a2, a3), columns=columns, name='bar', axis=1)
+            os.rmdir(fp)  # let it be re-created
+
+            columns = np.arange(6).astype('datetime64[D]')
+            NPY(fp, 'w').from_arrays(
+                blocks=(a1, a2, a3), columns=columns, name='bar', axis=1
+            )
             f = Frame.from_npy(fp)
             dt64 = np.datetime64
-            self.assertEqual(f.to_pairs(),
-                    ((dt64('1970-01-01'), ((0, 0), (1, 4), (2, 8))), (dt64('1970-01-02'), ((0, 1), (1, 5), (2, 9))), (dt64('1970-01-03'), ((0, 2), (1, 6), (2, 10))), (dt64('1970-01-04'), ((0, 3), (1, 7), (2, 11))), (dt64('1970-01-05'), ((0, 'a'), (1, 'b'), (2, 'c'))), (dt64('1970-01-06'), ((0, True), (1, False), (2, True))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (dt64('1970-01-01'), ((0, 0), (1, 4), (2, 8))),
+                    (dt64('1970-01-02'), ((0, 1), (1, 5), (2, 9))),
+                    (dt64('1970-01-03'), ((0, 2), (1, 6), (2, 10))),
+                    (dt64('1970-01-04'), ((0, 3), (1, 7), (2, 11))),
+                    (dt64('1970-01-05'), ((0, 'a'), (1, 'b'), (2, 'c'))),
+                    (dt64('1970-01-06'), ((0, True), (1, False), (2, True))),
+                ),
+            )
 
-    def test_archive_components_npy_write_arrays_k(self) -> None:
-
-        a1 = np.arange(12).reshape(3, 4)
-        a2 = np.array(['a', 'b', 'c'])
-        a3 = np.array([True, False, True])
-
-        with TemporaryDirectory() as fp:
-            with self.assertRaises(UnsupportedOperation):
-                NPY(fp, 'r').from_arrays(blocks=(a1, a2, a3))
-
-    #-----------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 
     def test_archive_components_npz_from_frames_a(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(index=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(int)').relabel(index=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
+
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=0)
 
             f = Frame.from_npy(fp)
-            self.assertEqual(f.to_pairs(),
-                    ((0, (('a', -88017), ('b', 92867), ('c', -88017), ('d', 92867))), (1, (('a', 162197), ('b', -41157), ('c', 162197), ('d', -41157))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (0, (('a', -88017), ('b', 92867), ('c', -88017), ('d', 92867))),
+                    (1, (('a', 162197), ('b', -41157), ('c', 162197), ('d', -41157))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_b(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(index=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(int)').relabel(index=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
+
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=0, include_index=False)
 
             f = Frame.from_npy(fp)
-            self.assertEqual(f.to_pairs(),
-                    ((0, ((0, -88017), (1, 92867), (2, -88017), (3, 92867))), (1, ((0, 162197), (1, -41157), (2, 162197), (3, -41157))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (0, ((0, -88017), (1, 92867), (2, -88017), (3, 92867))),
+                    (1, ((0, 162197), (1, -41157), (2, 162197), (3, -41157))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_c(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(columns=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(int)').relabel(columns=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=1)
 
             f = Frame.from_npy(fp)
-            self.assertEqual(f.to_pairs(),
-                    (('a', ((0, -88017), (1, 92867))), ('b', ((0, 162197), (1, -41157))), ('c', ((0, -88017), (1, 92867))), ('d', ((0, 162197), (1, -41157))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    ('a', ((0, -88017), (1, 92867))),
+                    ('b', ((0, 162197), (1, -41157))),
+                    ('c', ((0, -88017), (1, 92867))),
+                    ('d', ((0, 162197), (1, -41157))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_d(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(columns=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(int)').relabel(columns=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=1, include_columns=False)
 
             f = Frame.from_npy(fp)
-            self.assertEqual(f.to_pairs(),
-                    ((0, ((0, -88017), (1, 92867))), (1, ((0, 162197), (1, -41157))), (2, ((0, -88017), (1, 92867))), (3, ((0, 162197), (1, -41157))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (0, ((0, -88017), (1, 92867))),
+                    (1, ((0, 162197), (1, -41157))),
+                    (2, ((0, -88017), (1, 92867))),
+                    (3, ((0, 162197), (1, -41157))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_e(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)')
         f2 = ff.parse('s(2,2)|v(int)')
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_frames(frames=(f1, f2), axis=0)
 
@@ -436,6 +510,7 @@ class TestUnit(TestCase):
         f2 = ff.parse('s(2,2)|v(int)')
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_frames(frames=(f1, f2), axis=1)
 
@@ -444,6 +519,7 @@ class TestUnit(TestCase):
         f2 = ff.parse('s(2,2)|v(int)').relabel(columns=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_frames(frames=(f1, f2), axis=1, include_index=False)
 
@@ -452,6 +528,7 @@ class TestUnit(TestCase):
         f2 = ff.parse('s(2,2)|v(int)').relabel(index=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_frames(frames=(f1, f2), axis=0, include_columns=False)
 
@@ -460,28 +537,42 @@ class TestUnit(TestCase):
         f2 = ff.parse('s(2,2)|v(float)').relabel(index=('b', 'c'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=1, include_columns=False)
             f = Frame.from_npy(fp).fillna(0)
-            self.assertEqual(f.to_pairs(),
-                    ((0, (('a', 1930.4), ('b', -1760.34), ('c', 0))), (1, (('a', -610.8), ('b', 3243.94), ('c', 0))), (2, (('a', 0), ('b', 1930.4), ('c', -1760.34))), (3, (('a', 0), ('b', -610.8), ('c', 3243.94))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    (0, (('a', 1930.4), ('b', -1760.34), ('c', 0))),
+                    (1, (('a', -610.8), ('b', 3243.94), ('c', 0))),
+                    (2, (('a', 0), ('b', 1930.4), ('c', -1760.34))),
+                    (3, (('a', 0), ('b', -610.8), ('c', 3243.94))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_j(self) -> None:
         f1 = ff.parse('s(2,2)|v(float)').relabel(columns=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(float)').relabel(columns=('b', 'c'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             NPY(fp, 'w').from_frames(frames=(f1, f2), axis=0, include_index=False)
             f = Frame.from_npy(fp).fillna(0)
-            self.assertEqual(f.to_pairs(),
-                    (('a', ((0, 1930.4), (1, -1760.34), (2, 0.0), (3, 0.0))), ('b', ((0, -610.8), (1, 3243.94), (2, 1930.4), (3, -1760.34))), ('c', ((0, 0.0), (1, 0.0), (2, -610.8), (3, 3243.94))))
-                    )
+            self.assertEqual(
+                f.to_pairs(),
+                (
+                    ('a', ((0, 1930.4), (1, -1760.34), (2, 0.0), (3, 0.0))),
+                    ('b', ((0, -610.8), (1, 3243.94), (2, 1930.4), (3, -1760.34))),
+                    ('c', ((0, 0.0), (1, 0.0), (2, -610.8), (3, 3243.94))),
+                ),
+            )
 
     def test_archive_components_npz_from_frames_k(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(index=('a', 'b'))
         f2 = ff.parse('s(2,2)|v(int)').relabel(index=('c', 'd'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(RuntimeError):
                 NPY(fp, 'w').from_frames(frames=(f1, f2), axis=3)
 
@@ -490,12 +581,18 @@ class TestUnit(TestCase):
         f2 = ff.parse('s(2,2)|v(float)').relabel(columns=('b', 'c'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with NPY(fp, 'w') as npy:
                 npy.from_frames(frames=(f1, f2), axis=0, include_index=False)
                 f = Frame.from_npy(fp).fillna(0)
-                self.assertEqual(f.to_pairs(),
-                        (('a', ((0, 1930.4), (1, -1760.34), (2, 0.0), (3, 0.0))), ('b', ((0, -610.8), (1, 3243.94), (2, 1930.4), (3, -1760.34))), ('c', ((0, 0.0), (1, 0.0), (2, -610.8), (3, 3243.94))))
-                        )
+                self.assertEqual(
+                    f.to_pairs(),
+                    (
+                        ('a', ((0, 1930.4), (1, -1760.34), (2, 0.0), (3, 0.0))),
+                        ('b', ((0, -610.8), (1, 3243.94), (2, 1930.4), (3, -1760.34))),
+                        ('c', ((0, 0.0), (1, 0.0), (2, -610.8), (3, 3243.94))),
+                    ),
+                )
 
     def test_archive_components_npz_from_frames_m(self) -> None:
         f1 = ff.parse('s(2,2)|v(int)').relabel(index=('a', 'b'))
@@ -505,12 +602,13 @@ class TestUnit(TestCase):
             with self.assertRaises(UnsupportedOperation):
                 NPY(fp, 'r').from_frames(frames=(f1, f2), axis=3)
 
-    #-----------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 
     def test_archive_components_npy_contents_a(self) -> None:
         f1 = ff.parse('s(2,4)|v(int,str,bool,bool)').relabel(index=('a', 'b'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             f1.to_npy(fp)
 
             npy = NPY(fp, 'r')
@@ -522,7 +620,7 @@ class TestUnit(TestCase):
         f1 = ff.parse('s(2,4)|v(int,str,bool,bool)').relabel(index=('a', 'b'))
 
         with TemporaryDirectory() as fp:
-            f1.to_npy(fp)
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(UnsupportedOperation):
                 _ = NPY(fp, 'w').contents
 
@@ -539,6 +637,7 @@ class TestUnit(TestCase):
         f1 = ff.parse('s(2,4)|v(int,str,bool,bool)').relabel(index=('a', 'b'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             f1.to_npy(fp)
             npy = NPY(fp, 'r')
             self.assertEqual(npy.contents['size'].sum(), npy.nbytes)
@@ -547,12 +646,454 @@ class TestUnit(TestCase):
         f1 = ff.parse('s(2,4)|v(int,str,bool,bool)').relabel(index=('a', 'b'))
 
         with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             f1.to_npy(fp)
-            npy = NPY(fp, 'w')
+            with self.assertRaises(RuntimeError):
+                npy = NPY(fp, 'w')
+
+    def test_archive_components_npy_nbytes_c(self) -> None:
+        f1 = ff.parse('s(2,4)|v(int,str,bool,bool)').relabel(index=('a', 'b'))
+
+        with TemporaryDirectory() as fp:
+            os.rmdir(fp)  # let it be re-created
             with self.assertRaises(UnsupportedOperation):
-                _ = npy.nbytes
+                _ = NPY(fp, 'w').nbytes
+
+    def test_archive_zip_missing_cleanup(self) -> None:
+        # Test for cases where the specified file doesn't exist.
+        buffer = StringIO()
+        with contextlib.redirect_stderr(buffer):
+            with self.assertRaises(FileNotFoundError):
+                # Note at time of writing, the following is written to stderr
+                # `Exception ignored in: <function ArchiveZip.__del__>`
+                ArchiveZip('thisfiledoesntexist', writeable=False, memory_map=False)
+
+        # Assert that no error was printed to stderr.
+        self.assertEqual(buffer.getvalue(), '')
+
+    # ---------------------------------------------------------------------------
+    def test_archive_zip_file_open_a(self) -> None:
+        with temp_file('.zip') as fp:
+            with zipfile.ZipFile(fp, 'w', zipfile.ZIP_DEFLATED) as zf:
+                with self.assertRaises(RuntimeError):
+                    ArchiveZipWrapper(zf, writeable=True, memory_map=True, delimiter='/')
+
+    def test_archive_zip_file_open_b(self) -> None:
+        f1 = ff.parse('s(2,2)|v(int)').rename('a')
+        f2 = ff.parse('s(2,2)|v(bool)').rename('b')
+        b = Bus.from_frames((f1, f2))
+
+        with temp_file('.zip') as fp:
+            b.to_zip_npy(fp)
+
+            with zipfile.ZipFile(fp, 'r', zipfile.ZIP_DEFLATED) as zf:
+                archive = ArchiveZipWrapper(
+                    zf, writeable=False, memory_map=False, delimiter='/'
+                )
+
+                archive.prefix = 'b'
+                post1 = archive.read_array_header(NPYLabel.FILE_TEMPLATE_BLOCKS.format(0))
+                self.assertEqual(post1, (np.dtype('bool'), False, (2, 2)))
+
+                post2 = archive.size_array(NPYLabel.FILE_TEMPLATE_BLOCKS.format(0))
+                self.assertEqual(post2, 68)
+
+                post3 = archive.size_metadata()
+                self.assertEqual(post3, 90)
+
+    # ---------------------------------------------------------------------------
+
+    def test_archive_manifest_a1(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+        b2 = Bus.from_frames((f4, f5, f6))
+
+        with temp_file('.zip') as fp1, temp_file('.zip') as fp2:
+            b1.to_zip_npy(fp1)
+            b2.to_zip_npy(fp2)
+
+            # set max_persist to size to test when fully loaded with max_persist
+            b1d = Bus.from_zip_npy(fp1)
+            b2d = Bus.from_zip_npy(fp2)
+
+            y1 = Yarn.from_buses((b1d, b2d), retain_labels=False)
+
+            with TemporaryDirectory() as fp_dir:
+                ArchiveManifest.to_manifest(fp_dir, y1)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['f5'].shape, f5.shape)
+                self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_a2(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+        b2 = Bus.from_frames((f4, f5, f6))
+
+        config = StoreConfigNPY()
+
+        with temp_file('.zip') as fp1, temp_file('.zip') as fp2:
+            b1.to_zip_npy(fp1)
+            b2.to_zip_npy(fp2)
+
+            # set max_persist to size to test when fully loaded with max_persist
+            b1d = Bus.from_zip_npy(fp1, config=config)
+            b2d = Bus.from_zip_npy(fp2, config=config)
+
+            y1 = Yarn.from_buses((b1d, b2d), retain_labels=False).relabel(
+                ('a', 'b', 'c', 'd', 'e', 'f')
+            )
+            with TemporaryDirectory() as fp_dir:
+                ArchiveManifest.to_manifest(fp_dir, y1)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'a', 'b', 'c', 'd', 'e', 'f'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['e'].shape, f5.shape)
+                self.assertEqual(b3['a'].shape, f1.shape)
+
+    def test_archive_manifest_b(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+        b2 = Bus.from_frames((f4, f5, f6))
+
+        config = StoreConfigNPZ()
+
+        with temp_file('.zip') as fp1, temp_file('.zip') as fp2:
+            b1.to_zip_npz(fp1)
+            b2.to_zip_npz(fp2)
+
+            # set max_persist to size to test when fully loaded with max_persist
+            b1d = Bus.from_zip_npz(fp1, config=config)
+            b2d = Bus.from_zip_npz(fp2, config=config)
+
+            y1 = Yarn.from_buses((b1d, b2d), retain_labels=False)
+
+            with TemporaryDirectory() as fp_dir:
+                ArchiveManifest.to_manifest(fp_dir, y1)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['f5'].shape, f5.shape)
+                self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_c(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+        b2 = Bus.from_frames((f4, f5, f6))
+
+        config = StoreConfigPickle()
+
+        with temp_file('.zip') as fp1, temp_file('.zip') as fp2:
+            b1.to_zip_pickle(fp1)
+            b2.to_zip_pickle(fp2)
+
+            # set max_persist to size to test when fully loaded with max_persist
+            b1d = Bus.from_zip_pickle(fp1, config=config)
+            b2d = Bus.from_zip_pickle(fp2, config=config)
+
+            y1 = Yarn.from_buses((b1d, b2d), retain_labels=False)
+
+            with TemporaryDirectory() as fp_dir:
+                ArchiveManifest.to_manifest(fp_dir, y1)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['f5'].shape, f5.shape)
+                self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_d(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3, f4, f5, f6))
+
+        config = StoreConfigNPY()
+
+        with temp_file('.zip') as fp1:
+            b1.to_zip_npy(fp1)
+
+            with TemporaryDirectory() as fp_dir:
+                b1d = Bus.from_zip_npy(fp1, config=config)
+
+                ArchiveManifest.to_manifest(fp_dir, b1d)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['f5'].shape, f5.shape)
+                self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_e(self) -> None:
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3, f4, f5, f6))
+
+        config = StoreConfigNPZ()
+
+        with temp_file('.zip') as fp1:
+            b1.to_zip_npz(fp1)
+
+            with TemporaryDirectory() as fp_dir:
+                b1d = Bus.from_zip_npz(fp1, config=config)
+
+                ArchiveManifest.to_manifest(fp_dir, b1d)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+                )
+
+                b3 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                self.assertEqual(b3['f5'].shape, f5.shape)
+                self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_f(self) -> None:
+        # StoreXLSX-backed Bus
+        f1 = ff.parse('s(4,2)|i(I,str)|c(I,str)').rename('f1')
+        f2 = ff.parse('s(4,5)|i(I,str)|c(I,str)').rename('f2')
+        f3 = ff.parse('s(2,2)|i(I,str)|c(I,str)').rename('f3')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+
+        with temp_file('.xlsx') as fp1:
+            b1.to_xlsx(fp1)
+
+            with TemporaryDirectory() as fp_dir:
+                b1d = Bus.from_xlsx(fp1)
+
+                ArchiveManifest.to_manifest(fp_dir, b1d)
+
+                self.assertEqual(
+                    set(x.name for x in os.scandir(fp_dir)),
+                    {'f1', 'f2', 'f3'},
+                )
+
+                b2 = Bus.from_manifest(
+                    [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+                )
+                # compare against shape from XLSX round-trip (index is included as column)
+                self.assertEqual(b2['f1'].shape, b1d['f1'].shape)
+                self.assertEqual(b2['f3'].shape, b1d['f3'].shape)
+
+    def test_archive_manifest_g(self) -> None:
+        # in-memory Bus (no store)
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+
+        with TemporaryDirectory() as fp_dir:
+            ArchiveManifest.to_manifest(fp_dir, b1)
+
+            self.assertEqual(
+                set(x.name for x in os.scandir(fp_dir)),
+                {'f1', 'f2', 'f3'},
+            )
+
+            b2 = Bus.from_manifest(
+                [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+            )
+            self.assertEqual(b2['f1'].shape, f1.shape)
+            self.assertEqual(b2['f3'].shape, f3.shape)
+
+    def test_archive_manifest_h(self) -> None:
+        # Yarn built from in-memory buses (no store)
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+        f4 = ff.parse('s(2,8)').rename('f4')
+        f5 = ff.parse('s(4,4)').rename('f5')
+        f6 = ff.parse('s(6,4)').rename('f6')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+        b2 = Bus.from_frames((f4, f5, f6))
+        y1 = Yarn.from_buses((b1, b2), retain_labels=False)
+
+        with TemporaryDirectory() as fp_dir:
+            ArchiveManifest.to_manifest(fp_dir, y1)
+
+            self.assertEqual(
+                set(x.name for x in os.scandir(fp_dir)),
+                {'f1', 'f2', 'f3', 'f4', 'f5', 'f6'},
+            )
+
+            b3 = Bus.from_manifest(
+                [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+            )
+            self.assertEqual(b3['f5'].shape, f5.shape)
+            self.assertEqual(b3['f1'].shape, f1.shape)
+
+    def test_archive_manifest_i(self) -> None:
+        # in-memory Bus with integer labels; label_encoder required
+        f1 = ff.parse('s(4,2)').rename(10)
+        f2 = ff.parse('s(4,5)').rename(20)
+        f3 = ff.parse('s(2,2)').rename(30)
+
+        b1 = Bus.from_frames((f1, f2, f3))
+
+        with TemporaryDirectory() as fp_dir:
+            ArchiveManifest.to_manifest(fp_dir, b1, label_encoder=str)
+
+            self.assertEqual(
+                set(x.name for x in os.scandir(fp_dir)),
+                {'10', '20', '30'},
+            )
+
+            b2 = Bus.from_manifest(
+                [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+            )
+            self.assertEqual(b2['10'].shape, f1.shape)
+            self.assertEqual(b2['30'].shape, f3.shape)
+
+    def test_archive_manifest_j(self) -> None:
+        # Yarn from in-memory buses with integer labels; label_encoder required
+        f1 = ff.parse('s(4,2)').rename(10)
+        f2 = ff.parse('s(4,5)').rename(20)
+        f3 = ff.parse('s(2,2)').rename(30)
+        f4 = ff.parse('s(2,8)').rename(40)
+
+        b1 = Bus.from_frames((f1, f2))
+        b2 = Bus.from_frames((f3, f4))
+        y1 = Yarn.from_buses((b1, b2), retain_labels=False)
+
+        with TemporaryDirectory() as fp_dir:
+            ArchiveManifest.to_manifest(fp_dir, y1, label_encoder=str)
+
+            self.assertEqual(
+                set(x.name for x in os.scandir(fp_dir)),
+                {'10', '20', '30', '40'},
+            )
+
+            b3 = Bus.from_manifest(
+                [os.path.join(fp_dir, x.name) for x in os.scandir(fp_dir)]
+            )
+            self.assertEqual(b3['10'].shape, f1.shape)
+            self.assertEqual(b3['40'].shape, f4.shape)
+
+    def test_archive_manifest_k(self) -> None:
+        # Bus with integer labels and no label_encoder raises RuntimeError
+        f1 = ff.parse('s(4,2)').rename(10)
+        f2 = ff.parse('s(4,5)').rename(20)
+
+        b1 = Bus.from_frames((f1, f2))
+
+        with TemporaryDirectory() as fp_dir:
+            with self.assertRaises(RuntimeError):
+                ArchiveManifest.to_manifest(fp_dir, b1)
+
+    def test_archive_manifest_l(self) -> None:
+        # Yarn with integer labels and no label_encoder raises RuntimeError
+        f1 = ff.parse('s(4,2)').rename(10)
+        f2 = ff.parse('s(4,5)').rename(20)
+
+        b1 = Bus.from_frames((f1, f2))
+        y1 = Yarn.from_buses((b1,), retain_labels=False)
+
+        with TemporaryDirectory() as fp_dir:
+            with self.assertRaises(RuntimeError):
+                ArchiveManifest.to_manifest(fp_dir, y1)
+
+    def test_archive_manifest_m(self) -> None:
+        # non-directory path raises RuntimeError
+        f1 = ff.parse('s(4,2)').rename('f1')
+        b1 = Bus.from_frames((f1,))
+
+        with temp_file('.zip') as fp:
+            with self.assertRaises(RuntimeError):
+                ArchiveManifest.to_manifest(fp, b1)
+
+    def test_archive_manifest_n(self) -> None:
+        # unsupported container type raises NotImplementedError
+        f1 = ff.parse('s(4,2)').rename('f1')
+
+        with TemporaryDirectory() as fp_dir:
+            with self.assertRaises(NotImplementedError):
+                ArchiveManifest.to_manifest(fp_dir, f1)  # type: ignore[arg-type]
+
+    def test_archive_manifest_o(self) -> None:
+        # in-memory Bus (no store)
+        f1 = ff.parse('s(4,2)').rename('f1')
+        f2 = ff.parse('s(4,5)').rename('f2')
+        f3 = ff.parse('s(2,2)').rename('f3')
+
+        b1 = Bus.from_frames((f1, f2, f3))
+
+        with TemporaryDirectory() as fp_dir:
+            fp = os.path.join(fp_dir, 'test')
+            ArchiveManifest.to_manifest(fp, b1)
+            self.assertEqual(
+                set(x.name for x in os.scandir(fp)),
+                {'f1', 'f2', 'f3'},
+            )
 
 
 if __name__ == '__main__':
     import unittest
+
     unittest.main()

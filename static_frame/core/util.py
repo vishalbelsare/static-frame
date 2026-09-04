@@ -1,41 +1,83 @@
-from collections import abc
-from collections import defaultdict
-from collections import namedtuple
-from enum import Enum
-from functools import partial
-from functools import reduce
-from io import StringIO
-from itertools import chain
-from itertools import zip_longest
-from os import PathLike
-from urllib import request
-from copy import deepcopy
-from types import TracebackType
+from __future__ import annotations
 
+import ast
 import contextlib
 import datetime
+import math
+import multiprocessing as mp
 import operator
 import os
+import re
 import tempfile
-import typing as tp
 import warnings
+from collections import abc, defaultdict, namedtuple
+from collections.abc import Mapping
+from enum import Enum
+from fractions import Fraction
+from functools import partial, reduce
+from io import StringIO
+from itertools import chain, zip_longest
+from os import PathLike
 
-from arraykit import resolve_dtype
-from automap import FrozenAutoMap  # pylint: disable = E0611
 import numpy as np
+import typing_extensions as tp
+from arraykit import (
+    FrozenAutoMap,
+    array_to_tuple_iter,
+    astype_array,
+    column_2d_filter,
+    factorize,
+    first_true_1d,
+    group_ordering,
+    is_objectable,
+    is_objectable_dt64,
+    isna_element,
+    mloc,
+    nonzero_1d,
+    resolve_dtype,
+)
+from arraykit import prepare_iter_for_array as ak_prepare_iter_for_array
 
-from static_frame.core.exception import InvalidDatetime64Comparison
+from static_frame.core.exception import (
+    ErrorNotTruthy,
+    InvalidDatetime64Comparison,
+    InvalidDatetime64Initializer,
+    LocInvalid,
+)
 
 if tp.TYPE_CHECKING:
-    from static_frame.core.index_base import IndexBase #pylint: disable=W0611 #pragma: no cover
-    from static_frame.core.index import Index #pylint: disable=W0611 #pragma: no cover
-    from static_frame.core.series import Series #pylint: disable=W0611 #pragma: no cover
-    from static_frame.core.frame import Frame #pylint: disable=W0611 #pragma: no cover
-    from static_frame.core.frame import FrameAsType #pylint: disable=W0611 #pragma: no cover
-    from static_frame.core.type_blocks import TypeBlocks #pylint: disable=W0611 #pragma: no cover
+    from concurrent.futures import Executor
+    from types import TracebackType
+
+    from static_frame.core.frame import Frame
+    from static_frame.core.index import Index
+    from static_frame.core.index_auto import (
+        IndexAutoConstructorFactory,
+        IndexConstructorFactoryBase,
+    )
+    from static_frame.core.index_base import IndexBase
+    from static_frame.core.index_hierarchy import IndexHierarchy
+    from static_frame.core.series import Series
+    from static_frame.core.type_blocks import TypeBlocks
+
+TNDArrayAny = np.ndarray[tp.Any, tp.Any]
+TNDArrayBool = np.ndarray[tp.Any, np.dtype[np.bool_]]
+TNDArrayObject = np.ndarray[tp.Any, np.dtype[np.object_]]
+TNDArrayIntDefault = np.ndarray[tp.Any, np.dtype[np.int64]]
+
+TNDArray1DIntDefault = np.ndarray[tuple[tp.Any], np.dtype[np.int64]]
+TNDArray1DFloat64 = np.ndarray[tuple[tp.Any], np.dtype[np.float64]]
+TNDArray1DBool = np.ndarray[tuple[tp.Any], np.dtype[np.bool_]]
+TNDArray2DBool = np.ndarray[tuple[tp.Any, tp.Any], np.dtype[np.bool_]]
+
+
+TDtypeAny = np.dtype[tp.Any]
+TDtypeDT64 = np.dtype[np.datetime64]
+TDtypeObject = np.dtype[np.object_]
+TOptionalArrayList = tp.Optional[tp.List[TNDArrayAny]]
 
 # dtype.kind
-#     A character code (one of ‘biufcmMOSUV’) identifying the general kind of data.
+#     A character code (one of 'biufcmMOSUV') identifying the general kind of data.
 #     b 	boolean
 #     i 	signed integer
 #     u 	unsigned integer
@@ -50,10 +92,14 @@ if tp.TYPE_CHECKING:
 
 # https://docs.scipy.org/doc/numpy-1.10.1/reference/arrays.scalars.html
 
-
-DEFAULT_SORT_KIND = 'mergesort'
-DEFAULT_STABLE_SORT_KIND = 'mergesort' # for when results will be in correct if not used
-DEFAULT_FAST_SORT_KIND = 'quicksort' # for when fastest is all that we want
+TSortKinds = tp.Literal['quicksort', 'mergesort']
+DEFAULT_SORT_KIND: tp.Literal['mergesort'] = 'mergesort'
+DEFAULT_STABLE_SORT_KIND: tp.Literal['mergesort'] = (
+    'mergesort'  # for when results will be in correct if not used
+)
+DEFAULT_FAST_SORT_KIND: tp.Literal['quicksort'] = (
+    'quicksort'  # for when fastest is all that we want
+)
 
 DTYPE_DATETIME_KIND = 'M'
 DTYPE_TIMEDELTA_KIND = 'm'
@@ -62,62 +108,117 @@ DTYPE_FLOAT_KIND = 'f'
 DTYPE_OBJECT_KIND = 'O'
 DTYPE_BOOL_KIND = 'b'
 
-DTYPE_STR_KINDS = ('U', 'S') # S is np.bytes_
-DTYPE_INT_KINDS = ('i', 'u') # signed and unsigned
-DTYPE_INEXACT_KINDS = (DTYPE_FLOAT_KIND, DTYPE_COMPLEX_KIND) # kinds that support NaN values
+DTYPE_STR_KINDS = ('U', 'S')  # S is np.bytes_
+DTYPE_INT_KINDS = ('i', 'u')  # signed and unsigned
+DTYPE_INEXACT_KINDS = (
+    DTYPE_FLOAT_KIND,
+    DTYPE_COMPLEX_KIND,
+)  # kinds that support NaN values
 DTYPE_NAT_KINDS = (DTYPE_DATETIME_KIND, DTYPE_TIMEDELTA_KIND)
+
+# dtype kinds that cannot hold NaN/NaT/None and are always sortable: hash-factorize
+# (sort=True) is an exact, order-preserving replacement for a comparison sort of the
+# values. float/complex/object/datetime are excluded here because a sort=True factorize
+# regresses on near-unique data (it sorts ~n uniques) -- so ranking/unique keep the
+# comparison sort (which also treats each NaN as a distinct singleton).
+DTYPE_FACTORIZABLE_KINDS = frozenset(
+    (*DTYPE_INT_KINDS, *DTYPE_STR_KINDS, DTYPE_BOOL_KIND)
+)
+# duplicated additionally admits float: it factorizes with sort=False (no sort of the
+# uniques, hence no near-unique penalty), and NaN collapse is the intended semantic
+# (repeated NaN are marked as duplicates, matching pandas).
+_DUPLICATED_FACTORIZE_KINDS = DTYPE_FACTORIZABLE_KINDS | frozenset((DTYPE_FLOAT_KIND,))
 
 
 # all kinds that can have NaN, NaT, or None
-DTYPE_NA_KINDS = frozenset((
+DTYPE_NA_KINDS = frozenset(
+    (
         DTYPE_FLOAT_KIND,
         DTYPE_COMPLEX_KIND,
         DTYPE_DATETIME_KIND,
         DTYPE_TIMEDELTA_KIND,
         DTYPE_OBJECT_KIND,
-        ))
+    )
+)
+
+DTYPE_NAN_NAT_KINDS = frozenset(
+    (
+        DTYPE_FLOAT_KIND,
+        DTYPE_COMPLEX_KIND,
+        DTYPE_DATETIME_KIND,
+        DTYPE_TIMEDELTA_KIND,
+    )
+)
+
+# this is all kinds except 'V'
+# DTYPE_FALSY_KINDS = frozenset((
+#         DTYPE_FLOAT_KIND,
+#         DTYPE_COMPLEX_KIND,
+#         DTYPE_DATETIME_KIND,
+#         DTYPE_TIMEDELTA_KIND,
+#         DTYPE_OBJECT_KIND,
+#         DTYPE_BOOL_KIND,
+#         'U', 'S', # str kinds
+#         'i', 'u' # int kinds
+#         ))
 
 # all kinds that can use tolist() to go to a compatible Python type
-DTYPE_OBJECTABLE_KINDS = frozenset((
+DTYPE_OBJECTABLE_KINDS = frozenset(
+    (
         DTYPE_FLOAT_KIND,
         DTYPE_COMPLEX_KIND,
         DTYPE_OBJECT_KIND,
         DTYPE_BOOL_KIND,
-        'U', 'S', # str kinds
-        'i', 'u' # int kinds
-        ))
+        'U',
+        'S',  # str kinds
+        'i',
+        'u',  # int kinds
+    )
+)
 
-# all dt64 units that tolist() to go to a compatible Python type
+# all dt64 units that tolist() to go to a compatible Python type. Note that datetime.date.MINYEAR, MAXYEAR sets a limit that is more narrow than dt64
 # NOTE: similar to DT64_EXCLUDE_YEAR_MONTH_SUB_MICRO
-DTYPE_OBJECTABLE_DT64_UNITS = frozenset((
-        'D', 'h', 'm', 's', 'ms', 'us',
-        ))
-
+DTYPE_OBJECTABLE_DT64_UNITS = frozenset(
+    (
+        'D',
+        'h',
+        'm',
+        's',
+        'ms',
+        'us',
+    )
+)
 
 # all numeric types, plus bool
-DTYPE_NUMERICABLE_KINDS = frozenset((
+DTYPE_NUMERICABLE_KINDS = frozenset(
+    (
         DTYPE_FLOAT_KIND,
         DTYPE_COMPLEX_KIND,
         DTYPE_BOOL_KIND,
-        'i', 'u' # int kinds
-))
+        'i',
+        'u',  # int kinds
+    )
+)
 
 
 DTYPE_OBJECT = np.dtype(object)
 DTYPE_BOOL = np.dtype(bool)
 DTYPE_STR = np.dtype(str)
 DTYPE_INT_DEFAULT = np.dtype(np.int64)
-# DTYPE_INT_PLATFORM = np.dtype(int) # 32 on windows
+DTYPE_UINT_DEFAULT = np.dtype(np.uint64)
 
 DTYPE_FLOAT_DEFAULT = np.dtype(np.float64)
 DTYPE_COMPLEX_DEFAULT = np.dtype(np.complex128)
+DTYPE_YEAR_MONTH_STR = np.dtype('U7')
+DTYPE_YEAR_QUARTER_STR = np.dtype('U7')
 
 DTYPES_BOOL = (DTYPE_BOOL,)
 DTYPES_INEXACT = (DTYPE_FLOAT_DEFAULT, DTYPE_COMPLEX_DEFAULT)
 
-NULL_SLICE = slice(None) # gathers everything
+NULL_SLICE = slice(None)  # gathers everything
 UNIT_SLICE = slice(0, 1)
-EMPTY_SLICE = slice(0, 0) # gathers nothing
+EMPTY_SLICE = slice(0, 0)  # gathers nothing
+REVERSE_SLICE = slice(None, None, -1)
 
 SLICE_START_ATTR = 'start'
 SLICE_STOP_ATTR = 'stop'
@@ -127,196 +228,383 @@ SLICE_ATTRS = (SLICE_START_ATTR, SLICE_STOP_ATTR, SLICE_STEP_ATTR)
 STATIC_ATTR = 'STATIC'
 
 ELEMENT_TUPLE = (None,)
-
-EMPTY_TUPLE = ()
 EMPTY_SET: tp.FrozenSet[tp.Any] = frozenset()
+EMPTY_TUPLE: tp.Tuple[()] = ()
 
 # defaults to float64
-EMPTY_ARRAY = np.array(EMPTY_TUPLE, dtype=None)
+EMPTY_ARRAY: TNDArrayAny = np.array((), dtype=None)
 EMPTY_ARRAY.flags.writeable = False
 
-EMPTY_ARRAY_BOOL = np.array(EMPTY_TUPLE, dtype=DTYPE_BOOL)
+EMPTY_ARRAY_BOOL: TNDArrayAny = np.array((), dtype=DTYPE_BOOL)
 EMPTY_ARRAY_BOOL.flags.writeable = False
 
-EMPTY_ARRAY_INT = np.array(EMPTY_TUPLE, dtype=DTYPE_INT_DEFAULT)
+EMPTY_ARRAY_INT: TNDArrayAny = np.array((), dtype=DTYPE_INT_DEFAULT)
 EMPTY_ARRAY_INT.flags.writeable = False
+
+
+UNIT_ARRAY_INT: TNDArrayAny = np.array((0,), dtype=DTYPE_INT_DEFAULT)
+UNIT_ARRAY_INT.flags.writeable = False
+
+EMPTY_ARRAY_OBJECT = np.array((), dtype=DTYPE_OBJECT)
+EMPTY_ARRAY_OBJECT.flags.writeable = False
+
+EMPTY_FROZEN_AUTOMAP = FrozenAutoMap()
 
 NAT = np.datetime64('nat')
 NAT_STR = 'NaT'
+
+# this is a different NAT but can be treated the same
+NAT_TD64 = np.timedelta64('nat')
 
 # define missing for timedelta as an untyped 0
 EMPTY_TIMEDELTA = np.timedelta64(0)
 
 # map from datetime.timedelta attrs to np.timedelta64 codes
-TIME_DELTA_ATTR_MAP = (
-        ('days', 'D'),
-        ('seconds', 's'),
-        ('microseconds', 'us')
-        )
+TIME_DELTA_ATTR_MAP: tuple[tuple[str, tp.Literal['D', 's', 'us']]] = (
+    ('days', 'D'),
+    ('seconds', 's'),
+    ('microseconds', 'us'),
+)  # type: ignore
 
 # ufunc functions that will not work with DTYPE_STR_KINDS, but do work if converted to object arrays
 UFUNC_AXIS_STR_TO_OBJ = frozenset((np.min, np.max, np.sum))
 
-FALSY_VALUES = frozenset((0, '', None, EMPTY_TUPLE))
+FALSY_VALUES = frozenset((0, '', None, ()))
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # utility type groups
 
-INT_TYPES = (int, np.integer) # np.integer catches all np int
-FLOAT_TYPES = (float, np.floating) # np.floating catches all np float
-COMPLEX_TYPES = (complex, np.complexfloating) # np.complexfloating catches all np complex
-INEXACT_TYPES = (float, complex, np.inexact) # inexact matches floating, complexfloating
-InexactTypes = tp.Union[float, complex, np.inexact]
+INT_TYPES = (int, np.integer)  # np.integer catches all np int
+FLOAT_TYPES = (float, np.floating)  # np.floating catches all np float
+COMPLEX_TYPES = (
+    complex,
+    np.complexfloating,
+)  # np.complexfloating catches all np complex
+INEXACT_TYPES = (
+    float,
+    complex,
+    np.inexact,
+)  # inexact matches floating, complexfloating
 NUMERIC_TYPES = (int, float, complex, np.number)
-
 BOOL_TYPES = (bool, np.bool_)
 DICTLIKE_TYPES = (abc.Set, dict, FrozenAutoMap)
+STRING_TYPES = (str, bytes)
 
-
-# iterables that cannot be used in NP array constructors; asumes that dictlike types have already been identified
+# iterables that cannot be used in NP array constructors; assumes that dictlike types have already been identified
 INVALID_ITERABLE_FOR_ARRAY = (abc.ValuesView, abc.KeysView)
 NON_STR_TYPES = {int, float, bool}
 
 # integers above this value will occassionally, once coerced to a float (64 or 128) in an NP array, will not match a hash lookup as a key in a dictionary; an NP array of int or object will work
 INT_MAX_COERCIBLE_TO_FLOAT = 1_000_000_000_000_000
+INT64_MAX = np.iinfo(np.int64).max
 
 # for getitem / loc selection
 KEY_ITERABLE_TYPES = (list, np.ndarray)
-KeyIterableTypes = tp.Union[tp.Iterable[tp.Any], np.ndarray]
+TKeyIterable = tp.Union[tp.Iterable[tp.Any], TNDArrayAny]
 
 # types of keys that return multiple items, even if the selection reduces to 1
-KEY_MULTIPLE_TYPES = (slice, list, np.ndarray)
+KEY_MULTIPLE_TYPES = (np.ndarray, list, slice)
 
-# for type hinting
+TILocSelectorOne = tp.Union[int, np.integer[tp.Any]]
+TILocSelectorMany = tp.Union[TNDArrayAny, tp.List[int], slice, None]
+TILocSelector = tp.Union[TILocSelectorOne, TILocSelectorMany]
+TILocSelectorCompound = tp.Union[TILocSelector, tp.Tuple[TILocSelector, TILocSelector]]
+
+TInt = tp.Union[int, np.integer[tp.Any]]
+
+# NOTE: slice is not hashable
+# NOTE: this is TLocSelectorOne
+TLabel = tp.Union[
+    tp.Hashable,
+    TInt,
+    bool,
+    np.bool_,
+    float,
+    complex,
+    np.inexact[tp.Any],
+    str,
+    bytes,
+    None,
+    np.datetime64,
+    np.timedelta64,
+    datetime.date,
+    datetime.datetime,
+    tp.Tuple['TLabel', ...],
+]
+
+TLocSelectorMany = tp.Union[
+    slice,
+    list[str],
+    list[int],
+    list[TLabel],
+    TNDArrayAny,
+    'IndexBase',
+    'Series',
+]
+
+TLocSelectorNonContainer = tp.Union[
+    TLabel,
+    slice,
+    tp.List[TLabel],
+    TNDArrayAny,
+]
+
 # keys once dimension has been isolated
-GetItemKeyType = tp.Union[
-        int,
-        np.integer,
-        slice,
-        tp.List[tp.Any],
-        None,
-        'Index',
-        'Series',
-        np.ndarray
-        ]
+TLocSelector = tp.Union[TLabel, TLocSelectorMany]
 
 # keys that might include a multiple dimensions speciation; tuple is used to identify compound extraction
-GetItemKeyTypeCompound = tp.Union[
-        tp.Tuple[tp.Any, ...],
-        int,
-        np.integer,
-        slice,
-        tp.List[tp.Any],
-        None,
-        'Index',
-        'Series',
-        np.ndarray]
+TLocSelectorCompound = tp.Union[TLocSelector, tp.Tuple[TLocSelector, TLocSelector]]
 
-KeyTransformType = tp.Optional[tp.Callable[[GetItemKeyType], GetItemKeyType]]
-NameType = tp.Optional[tp.Hashable]
-TupleConstructorType = tp.Callable[[tp.Iterator[tp.Any]], tp.Tuple[tp.Any, ...]]
+TKeyTransform = tp.Optional[tp.Callable[[TLocSelector], TLocSelector]]
+TName = TLabel  # include name default?
 
-Bloc2DKeyType = tp.Union['Frame', np.ndarray]
+TTupleCtor = tp.Union[
+    tp.Callable[[tp.Iterable[tp.Any]], tp.Sequence[tp.Any]], tp.Type[tp.Tuple[tp.Any]]
+]
+
+TBlocKey = tp.Union['Frame', TNDArrayAny, None]
 # Bloc1DKeyType = tp.Union['Series', np.ndarray]
 
-UFunc = tp.Callable[..., np.ndarray]
-AnyCallable = tp.Callable[..., tp.Any]
+TUFunc = tp.Callable[..., TNDArrayAny]
+TCallableAny = tp.Callable[..., tp.Any]
 
-Mapping = tp.Union[tp.Mapping[tp.Hashable, tp.Any], 'Series']
-CallableOrMapping = tp.Union[AnyCallable, tp.Mapping[tp.Hashable, tp.Any], 'Series']
+TMapping = tp.Union[tp.Mapping[TLabel, tp.Any], 'Series']
+TCallableOrMapping = tp.Union[TCallableAny, tp.Mapping[TLabel, tp.Any], 'Series']
 
-ShapeType = tp.Union[int, tp.Tuple[int, int]]
+TShape = tp.Union[int, tp.Tuple[int, ...]]
+
+# mloc, shape, and strides
+TArraySignature = tp.Tuple[int, tp.Tuple[int, ...], tp.Tuple[int, ...]]
+
+
+def array_signature(value: TNDArrayAny) -> TArraySignature:
+    return mloc(value), value.shape, value.strides
+
 
 def is_mapping(value: tp.Any) -> bool:
     from static_frame import Series
-    return isinstance(value, (dict, Series))
 
-def is_callable_or_mapping(value: CallableOrMapping) -> bool:
+    return isinstance(value, (Mapping, Series))
+
+
+def is_callable_or_mapping(value: tp.Any) -> bool:
     from static_frame import Series
-    return callable(value) or isinstance(value, dict) or isinstance(value, Series)
 
-CallableOrCallableMap = tp.Union[AnyCallable, tp.Mapping[tp.Hashable, AnyCallable]]
-
-# for explivitl selection hashables, or things that will be converted to lists of hashables (explicitly lists)
-KeyOrKeys = tp.Union[tp.Hashable, tp.Iterable[tp.Hashable]]
-BoolOrBools = tp.Union[bool, tp.Iterable[bool]]
+    return callable(value) or isinstance(value, Mapping) or isinstance(value, Series)
 
 
+TCallableOrCallableMap = tp.Union[TCallableAny, tp.Mapping[TLabel, TCallableAny]]
 
-PathSpecifier = tp.Union[str, PathLike]
-PathSpecifierOrFileLike = tp.Union[str, PathLike, tp.TextIO]
-PathSpecifierOrFileLikeOrIterator = tp.Union[str, PathLike, tp.TextIO, tp.Iterator[str]]
+# for explicit selection hashables, or things that will be converted to lists of hashables (explicitly lists)
+TKeyOrKeys = tp.Union[TLabel, tp.Iterable[TLabel]]
+TBoolOrBools = tp.Union[bool, tp.Sequence[bool]]
+
+TPathSpecifier = tp.Union[str, PathLike[tp.Any]]
+TPathSpecifierOrIO = tp.Union[str, PathLike[tp.Any], tp.IO[tp.Any]]
+TPathSpecifierOrBinaryIO = tp.Union[str, PathLike[tp.Any], tp.BinaryIO]
+TPathSpecifierOrTextIO = tp.Union[str, PathLike[tp.Any], tp.TextIO]
+TPathSpecifierOrTextIOOrIterator = tp.Union[
+    str, PathLike[tp.Any], tp.TextIO, tp.Iterator[str]
+]
+
+TDtypeSpecifier = tp.Union[str, TDtypeAny, type, None]
+TDtypeOrDT64 = tp.Union[TDtypeAny, tp.Type[np.datetime64]]
 
 
-DtypeSpecifier = tp.Optional[tp.Union[str, np.dtype, type]]
+def validate_dtype_specifier(value: tp.Any) -> None | TDtypeAny:
+    if value is None or isinstance(value, np.dtype):
+        return value
+
+    dt: TDtypeAny = np.dtype(value)
+    if dt == DTYPE_OBJECT and value is not object and value not in ('object', '|O'):
+        # fail on implicit conversion to object dtype
+        raise TypeError(
+            f'Implicit NumPy conversion of a type {value!r} to an object dtype; use `object` instead.'
+        )
+    return dt
+
 
 DTYPE_SPECIFIER_TYPES = (str, np.dtype, type)
+
 
 def is_dtype_specifier(value: tp.Any) -> bool:
     return isinstance(value, DTYPE_SPECIFIER_TYPES)
 
+
+def is_neither_slice_nor_mask(value: TLocSelectorNonContainer) -> bool:
+    is_slice = value.__class__ is slice
+    is_mask = value.__class__ is np.ndarray and value.dtype == DTYPE_BOOL
+    return not is_slice and not is_mask
+
+
+def is_strict_int(value: tp.Any) -> bool:
+    """Strict check that does not include bools as an int"""
+    if value is None:
+        return False
+    if value.__class__ is bool or value.__class__ is np.bool_:
+        return False
+    return isinstance(value, INT_TYPES)
+
+
+def depth_level_from_specifier(
+    key: TDepthLevelSpecifier,
+    size: int,
+) -> TDepthLevel:
+    """Determine if a key is strictly an ILoc-style key. This is used in `IndexHierarchy`, where at times we select "columns" (or depths) by integer (not name or per-depth names, as such attributes are not required), and we cannot assume the caller gives us integers, as some types of inputs (Python lists of Booleans) might work due to low-level duckyness.
+
+    This does not permit selection by tuple elements at this time, as that is not possible for IndexHierarchy depth selection.
+    """
+    if key is None:
+        return list(range(size))
+    elif key.__class__ is np.ndarray:
+        # let object dtype use iterable path
+        if key.dtype.kind in DTYPE_INT_KINDS:
+            return key.tolist()  # type: ignore
+        elif key.dtype == DTYPE_BOOL:
+            return PositionsAllocator.get(size)[key].tolist()  # type: ignore
+        elif key.dtype.kind == DTYPE_OBJECT_KIND:
+            for e in key:
+                if not is_strict_int(e):
+                    raise KeyError(f'Cannot select depths by non integer: {e!r}')
+            return key.tolist()  # type: ignore
+        raise KeyError(f'Cannot select depths by NumPy array of dtype: {key.dtype!r}')
+    elif key.__class__ is slice:
+        if key.start is not None and not is_strict_int(key.start):
+            raise KeyError(f'Cannot select depths by non integer slices: {key!r}')
+        if key.stop is not None and not is_strict_int(key.stop):
+            raise KeyError(f'Cannot select depths by non integer slices: {key!r}')
+        return list(range(*key.indices(size)))
+    elif isinstance(key, list):
+        # an iterable, or an object dtype array
+        for e in key:
+            if not is_strict_int(e):
+                raise KeyError(f'Cannot select depths by non integer: {e!r}')
+        return key
+    if not is_strict_int(key):
+        raise KeyError(f'Cannot select depths by non integer: {key!r}')
+    return key  # type: ignore
+
+
+def dtypes_retain_sortedness(from_: TDtypeAny, to: TDtypeAny) -> bool:
+    # Trivial
+    if from_ == to:
+        return True
+
+    # Safe conversion to object
+    if from_.kind in DTYPE_OBJECTABLE_KINDS and to.kind == 'O':
+        return True
+
+    # There are way too many invalidating edge cases for this.
+    if from_.kind in DTYPE_NAT_KINDS or to.kind in DTYPE_NAT_KINDS:
+        return False
+
+    # Check for low-high precision casting within the same numerical type
+    if (kind := from_.kind) == to.kind:
+        if kind in DTYPE_NUMERICABLE_KINDS or kind in DTYPE_STR_KINDS:
+            return to.itemsize > from_.itemsize
+
+    # Only safe to go from numeric->bool when unsigned!
+    if from_.kind == 'u' and to.kind == DTYPE_BOOL_KIND:
+        return True
+
+    if from_.kind == DTYPE_BOOL_KIND and to.kind in DTYPE_NUMERICABLE_KINDS:
+        return True
+
+    return False
+
+
 # support an iterable of specifiers, or mapping based on column names
-DtypesSpecifier = tp.Optional[tp.Union[
-        DtypeSpecifier,
-        tp.Iterable[DtypeSpecifier],
-        tp.Dict[tp.Hashable, DtypeSpecifier]
-        ]]
+TDtypesSpecifier = (
+    None | TDtypeSpecifier | tp.Iterable[TDtypeSpecifier] | dict[TLabel, TDtypeSpecifier]
+)
 
-# specifiers that are equivalent to object
-DTYPE_SPECIFIERS_OBJECT = {DTYPE_OBJECT, object, tuple}
+TDepthLevelSpecifierOne = int
+TDepthLevelSpecifierMany = tp.Union[tp.List[int], slice, TNDArrayIntDefault, None]
+TDepthLevelSpecifier = tp.Union[TDepthLevelSpecifierOne, TDepthLevelSpecifierMany]
 
-DepthLevelSpecifier = tp.Union[int, tp.Iterable[int]]
+TDepthLevel = tp.Union[int, tp.List[int]]
 
-CallableToIterType = tp.Callable[[], tp.Iterable[tp.Any]]
+TCallableToIter = tp.Callable[[], tp.Iterable[tp.Any]]
 
-IndexSpecifier = tp.Union[int, tp.Hashable] # specify a postiion in an index
-IndexInitializer = tp.Union[
-        'IndexBase',
-        tp.Iterable[tp.Hashable],
-        tp.Iterable[tp.Sequence[tp.Hashable]], # only for IndexHierarhcy
-        ]
+TIndexSpecifier = tp.Union[int, TLabel]  # specify a position in an index
+TIndexInitializer = tp.Union[
+    'IndexBase',
+    tp.Iterable[TLabel],
+    tp.Iterable[tp.Sequence[TLabel]],  # only for IndexHierarchy
+    # tp.Type['IndexAutoFactory'],
+]
 
-IndexConstructor = tp.Optional[tp.Callable[..., 'IndexBase']]
-IndexConstructors = tp.Union[IndexConstructor, tp.Sequence[IndexConstructor], None]
+# NOTE: this should include tp.Type['IndexAutoConstructorFactory']
+TIndexCtor = tp.Union[
+    tp.Callable[..., 'IndexBase'],
+    tp.Type['Index'],
+]
+TIndexHierarchyCtor = tp.Union[
+    tp.Callable[..., 'IndexHierarchy'], tp.Type['IndexHierarchy']
+]
 
+TIndexCtorSpecifier = tp.Optional[TIndexCtor]
+
+TIndexCtorSpecifiers = tp.Union[
+    TIndexCtorSpecifier,
+    tp.Sequence[TIndexCtorSpecifier],
+    tp.Iterable[TIndexCtorSpecifier],
+    TNDArrayObject,  # object array of constructors
+    None,
+    tp.Type['IndexAutoConstructorFactory'],
+]
+
+TExplicitIndexCtor = tp.Union[
+    TIndexCtorSpecifier,
+    'IndexConstructorFactoryBase',
+    tp.Type['IndexConstructorFactoryBase'],
+    None,
+]
 # take integers for size; otherwise, extract size from any other index initializer
 
-SeriesInitializer = tp.Union[
-        tp.Iterable[tp.Any],
-        np.ndarray,
-        tp.Mapping[tp.Hashable, tp.Any],
-        int, float, str, bool]
+TSeriesInitializer = tp.Union[
+    tp.Iterable[tp.Any],
+    TNDArrayAny,
+]
 
 # support single items, or numpy arrays, or values that can be made into a 2D array
 FRAME_INITIALIZER_DEFAULT = object()
 CONTINUATION_TOKEN_INACTIVE = object()
 ZIP_LONGEST_DEFAULT = object()
 
-FrameInitializer = tp.Union[
-        tp.Iterable[tp.Iterable[tp.Any]],
-        np.ndarray,
-        ] # need to add FRAME_INITIALIZER_DEFAULT
+TFrameInitializer = tp.Union[
+    tp.Iterable[tp.Iterable[tp.Any]],
+    TNDArrayAny,
+    'TypeBlocks',
+    'Frame',
+    'Series',
+]
 
-DateInitializer = tp.Union[str, datetime.date, np.datetime64]
-YearMonthInitializer = tp.Union[str, datetime.date, np.datetime64]
-YearInitializer = tp.Union[str, datetime.date, np.datetime64]
+TDateInitializer = tp.Union[int, np.integer[tp.Any], str, datetime.date, np.datetime64]
+TYearMonthInitializer = tp.Union[
+    int, np.integer[tp.Any], str, datetime.date, np.datetime64
+]
+TYearInitializer = tp.Union[int, np.integer[tp.Any], str, datetime.date, np.datetime64]
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+
+TCSVQuoting = tp.Literal[0, 1, 2, 3, 4, 5]
+
+# -------------------------------------------------------------------------------
 FILL_VALUE_DEFAULT = object()
 NAME_DEFAULT = object()
 STORE_LABEL_DEFAULT = object()
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 NOT_IN_CACHE_SENTINEL = object()
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # operator mod does not have r methods; create complete method reference
-OPERATORS: tp.Dict[str, UFunc] = {
+OPERATORS: tp.Dict[str, TUFunc] = {  # pyright: ignore
     '__pos__': operator.__pos__,
     '__neg__': operator.__neg__,
     '__abs__': operator.__abs__,
     '__invert__': operator.__invert__,
-
     '__add__': operator.__add__,
     '__sub__': operator.__sub__,
     '__mul__': operator.__mul__,
@@ -324,7 +612,6 @@ OPERATORS: tp.Dict[str, UFunc] = {
     '__truediv__': operator.__truediv__,
     '__floordiv__': operator.__floordiv__,
     '__mod__': operator.__mod__,
-
     '__pow__': operator.__pow__,
     '__lshift__': operator.__lshift__,
     '__rshift__': operator.__rshift__,
@@ -340,7 +627,14 @@ OPERATORS: tp.Dict[str, UFunc] = {
 }
 
 # extend r methods
-for attr in ('__add__', '__sub__', '__mul__', '__matmul__', '__truediv__', '__floordiv__'):
+for attr in (
+    '__add__',
+    '__sub__',
+    '__mul__',
+    '__matmul__',
+    '__truediv__',
+    '__floordiv__',
+):
     func = getattr(operator, attr)
     # bind func from closure
     rfunc = lambda rhs, lhs, func=func: func(lhs, rhs)
@@ -348,50 +642,317 @@ for attr in ('__add__', '__sub__', '__mul__', '__matmul__', '__truediv__', '__fl
     rattr = '__r' + attr[2:]
     OPERATORS[rattr] = rfunc
 
-#-------------------------------------------------------------------------------
+UFUNC_TO_REVERSE_OPERATOR: tp.Dict[TUFunc, TUFunc] = {
+    # '__pos__': operator.__pos__,
+    # '__neg__': operator.__neg__,
+    # '__abs__': operator.__abs__,
+    # '__invert__': operator.__invert__,
+    np.add: OPERATORS['__radd__'],
+    np.subtract: OPERATORS['__rsub__'],
+    np.multiply: OPERATORS['__rmul__'],
+    np.matmul: OPERATORS['__rmatmul__'],
+    np.true_divide: OPERATORS['__rtruediv__'],
+    np.floor_divide: OPERATORS['__rfloordiv__'],
+    # '__mod__': operator.__mod__,
+    # '__pow__': operator.__pow__,
+    # '__lshift__': operator.__lshift__,
+    # '__rshift__': operator.__rshift__,
+    # '__and__': operator.__and__,
+    # '__xor__': operator.__xor__,
+    # '__or__': operator.__or__,
+    np.less: OPERATORS['__gt__'],
+    np.less_equal: OPERATORS['__ge__'],
+    np.equal: OPERATORS['__eq__'],
+    np.not_equal: OPERATORS['__ne__'],
+    np.greater: OPERATORS['__lt__'],
+    np.greater_equal: OPERATORS['__le__'],
+}
+
+
+class IterNodeType(Enum):
+    VALUES = 1
+    ITEMS = 2
+
+
+class SortStatus(Enum):
+    ASC = 1
+    DESC = 2
+    UNKNOWN = 3
+
+    def derive_status_from_slice(self, sl: slice) -> SortStatus:
+        if self is SortStatus.UNKNOWN:
+            return self
+
+        if sl.step is None or sl.step >= 1:
+            return self
+
+        # Reverse!
+        return SortStatus.DESC if self is SortStatus.ASC else SortStatus.ASC
+
+    @classmethod
+    def from_bool(cls, ascending: bool) -> tp.Literal[SortStatus.ASC, SortStatus.DESC]:
+        """
+        Derive the appropriate enum for the ascending argument.
+
+        If ascending is True, return `SortStatus.ASC`
+        If ascending is False, return `SortStatus.DESC`
+        """
+        return cls.ASC if ascending else cls.DESC
+
+    @classmethod
+    def from_range_step(cls, step: int) -> tp.Literal[SortStatus.ASC, SortStatus.DESC]:
+        return cls.ASC if step >= 1 else cls.DESC
+
+    @classmethod
+    def from_sort_kwargs(
+        cls,
+        ascending: TBoolOrBools,
+        key: tp.Any,
+        kind: TSortKinds,
+    ) -> SortStatus:
+        """
+        Derive the appropriate enum for the ascending argument.
+
+        If ascending is a sequence of bools:
+        - `SortStatus.ASC` iif all flags are True
+        - `SortStatus.DESC` iif all flags are False
+        - `SortStatus.UNKNOWN` else
+
+        If key is not None, return `SortStatus.UNKNOWN`
+        If kind is not 'mergsort', return `SortStatus.UNKNOWN`
+        """
+        if key is not None or kind != DEFAULT_SORT_KIND:
+            return cls.UNKNOWN
+
+        if not (ascending is True or ascending is False):
+            count = sum(ascending)
+            if count != len(ascending) or (ascending := count != 0):
+                return cls.UNKNOWN
+
+        return cls.ASC if ascending else cls.DESC
+
+
+# -------------------------------------------------------------------------------
 class WarningsSilent:
-    '''Alternate context manager for silencing warnings with less overhead.
-    '''
+    """Alternate context manager for silencing warnings with less overhead."""
+
     __slots__ = ('previous_warnings',)
 
     FILTER = [('ignore', None, Warning, None, 0)]
 
     def __enter__(self) -> None:
-        self.previous_warnings = warnings.filters #type: ignore
-        warnings.filters = self.FILTER #type: ignore
+        self.previous_warnings = warnings.filters
+        warnings.filters = self.FILTER
 
-    def __exit__(self,
-            type: tp.Type[BaseException],
-            value: BaseException,
-            traceback: TracebackType,
-            ) -> None:
-        warnings.filters = self.previous_warnings #type: ignore
+    def __exit__(
+        self,
+        type: tp.Type[BaseException],
+        value: BaseException,
+        traceback: TracebackType,
+    ) -> None:
+        warnings.filters = self.previous_warnings
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
+
+
+def _ufunc_logical_skipna(
+    array: TNDArrayAny,
+    ufunc: TCallableAny,
+    skipna: bool,
+    axis: int = 0,
+    out: tp.Optional[TNDArrayAny] = None,
+) -> tp.Any:
+    """
+    Given a logical (and, or) ufunc that does not support skipna, implement skipna behavior.
+    """
+    if ufunc != np.all and ufunc != np.any:
+        raise NotImplementedError(f'unsupported ufunc ({ufunc}); use np.all or np.any')
+
+    if len(array) == 0:
+        # any() of an empty array is False
+        return ufunc == np.all
+
+    kind = array.dtype.kind
+
+    # ---------------------------------------------------------------------------
+    # types that cannot have NA
+    if kind == 'b':
+        return ufunc(array, axis=axis, out=out)
+    if kind in DTYPE_INT_KINDS:
+        return ufunc(array, axis=axis, out=out)
+    if kind in DTYPE_STR_KINDS:
+        # only string in object arrays can be converted to bool, where the empty string will be evaluated as False; here, manually check
+        return ufunc(array != '', axis=axis, out=out)
+
+    # ---------------------------------------------------------------------------
+    # types that can have NA
+
+    if kind in DTYPE_INEXACT_KINDS:
+        isna = isna_array(array)
+        hasna = isna.any()  # returns single value for 1d, 2d
+        if hasna and skipna:
+            fill_value = 0.0 if ufunc == np.any else 1.0
+            v = array.copy()
+            v[isna] = fill_value
+            return ufunc(v, axis=axis, out=out)
+        # NOTE: NaN will be interpreted as True
+        return ufunc(array, axis=axis, out=out)
+
+    if kind == 'O':
+        # all object types: convert to boolean aray then process
+        isna = isna_array(array)
+        hasna = isna.any()  # returns single value for 1d, 2d
+        if hasna and skipna:
+            # supply True for np.all, False for np.any
+            fill_value = False if ufunc == np.any else True
+            v = array.astype(bool)  # nan will be converted to True
+            v[isna] = fill_value
+        else:
+            # NOTE: NaN will be converted to True, None will be converted to False
+            v = array.astype(bool)
+        return ufunc(v, axis=axis, out=out)
+
+    # all other types assume truthy
+    # if kind in DTYPE_NAT_KINDS: # all dates are truthy, NAT is truthy
+
+    if array.ndim == 1:
+        return True
+    return np.full(array.shape[0 if axis else 1], fill_value=True, dtype=bool)
+
+
+def ufunc_all(
+    array: TNDArrayAny, axis: int = 0, out: tp.Optional[TNDArrayAny] = None
+) -> tp.Any:
+    return _ufunc_logical_skipna(array, ufunc=np.all, skipna=False, axis=axis, out=out)
+
+
+ufunc_all.__doc__ = np.all.__doc__
+
+
+def ufunc_any(
+    array: TNDArrayAny, axis: int = 0, out: tp.Optional[TNDArrayAny] = None
+) -> tp.Any:
+    return _ufunc_logical_skipna(array, ufunc=np.any, skipna=False, axis=axis, out=out)
+
+
+ufunc_any.__doc__ = np.any.__doc__
+
+
+def ufunc_nanall(
+    array: TNDArrayAny, axis: int = 0, out: tp.Optional[TNDArrayAny] = None
+) -> tp.Any:
+    return _ufunc_logical_skipna(array, ufunc=np.all, skipna=True, axis=axis, out=out)
+
+
+def ufunc_nanany(
+    array: TNDArrayAny, axis: int = 0, out: tp.Optional[TNDArrayAny] = None
+) -> tp.Any:
+    return _ufunc_logical_skipna(array, ufunc=np.any, skipna=True, axis=axis, out=out)
+
+
+# -------------------------------------------------------------------------------
+
+
+def _ufunc_numeric_skipna(
+    array: TNDArrayAny,
+    axis: int,
+    allna: float,
+    func: TUFunc,
+    allna_default: float,
+    out: tp.Optional[TNDArrayAny],
+) -> TNDArrayAny:
+    """Alternate func that permits specifying `allna`."""
+    out_provided = out is not None
+
+    if allna == allna_default:  # NumPy default, use default
+        return func(array, axis, out=out)
+
+    if out_provided:
+        func(array, axis, out=out)
+    else:
+        out = func(array, axis)
+    assert out is not None
+
+    if array.ndim == 1:
+        if out == allna_default:  # might be all NaN
+            if isna_array(array).all():
+                if out_provided:
+                    out[None] = allna
+                    return out
+                return allna  # type: ignore
+        return out
+
+    # ndim == 2
+    if (out == allna_default).any():
+        out[isna_array(array).all(axis)] = allna
+
+    out.flags.writeable = False
+    return out
+
+
+def ufunc_nanprod(
+    array: TNDArrayAny,
+    axis: int = 0,
+    allna: float = 1,
+    out: tp.Optional[TNDArrayAny] = None,
+) -> TNDArrayAny:
+    """Alternate nanprod that permits specifying `allna`."""
+    return _ufunc_numeric_skipna(
+        array,
+        axis,
+        allna,
+        np.nanprod,
+        1,
+        out,
+    )
+
+
+def ufunc_nansum(
+    array: TNDArrayAny,
+    axis: int = 0,
+    allna: float = 1,
+    out: tp.Optional[TNDArrayAny] = None,
+) -> TNDArrayAny:
+    """Alternate nansum that permits specifying `allna`."""
+    return _ufunc_numeric_skipna(
+        array,
+        axis,
+        allna,
+        np.nansum,
+        0,
+        out,
+    )
+
+
+# -------------------------------------------------------------------------------
 class UFuncCategory(Enum):
     BOOL = 0
     SELECTION = 1
-    STATISTICAL = 2 # go to default float type if int, float/complex keep size
-    CUMMULATIVE = 3 # go to max size if int, float/complex keep size
-    SUMMING = 4 # same except bool goes to max int
+    STATISTICAL = 2  # go to default float type if int, float/complex keep size
+    CUMMULATIVE = 3  # go to max size if int, float/complex keep size
+    SUMMING = 4  # same except bool goes to max int
 
-UFUNC_MAP: tp.Dict[UFunc, UFuncCategory] = {
+
+UFUNC_MAP: tp.Dict[TCallableAny, UFuncCategory] = {
     all: UFuncCategory.BOOL,
     any: UFuncCategory.BOOL,
     np.all: UFuncCategory.BOOL,
     np.any: UFuncCategory.BOOL,
-
+    ufunc_all: UFuncCategory.BOOL,
+    ufunc_any: UFuncCategory.BOOL,
+    ufunc_nanall: UFuncCategory.BOOL,
+    ufunc_nanany: UFuncCategory.BOOL,
     sum: UFuncCategory.SUMMING,
     np.sum: UFuncCategory.SUMMING,
     np.nansum: UFuncCategory.SUMMING,
-
+    ufunc_nansum: UFuncCategory.SUMMING,
     min: UFuncCategory.SELECTION,
     np.min: UFuncCategory.SELECTION,
     np.nanmin: UFuncCategory.SELECTION,
     max: UFuncCategory.SELECTION,
     np.max: UFuncCategory.SELECTION,
     np.nanmax: UFuncCategory.SELECTION,
-
     np.mean: UFuncCategory.STATISTICAL,
     np.nanmean: UFuncCategory.STATISTICAL,
     np.median: UFuncCategory.STATISTICAL,
@@ -400,46 +961,58 @@ UFUNC_MAP: tp.Dict[UFunc, UFuncCategory] = {
     np.nanstd: UFuncCategory.STATISTICAL,
     np.var: UFuncCategory.STATISTICAL,
     np.nanvar: UFuncCategory.STATISTICAL,
-
     np.prod: UFuncCategory.CUMMULATIVE,
     np.nanprod: UFuncCategory.CUMMULATIVE,
+    ufunc_nanprod: UFuncCategory.CUMMULATIVE,
     np.cumsum: UFuncCategory.CUMMULATIVE,
     np.nancumsum: UFuncCategory.CUMMULATIVE,
     np.cumprod: UFuncCategory.CUMMULATIVE,
     np.nancumprod: UFuncCategory.CUMMULATIVE,
 }
 
-def ufunc_dtype_to_dtype(func: UFunc, dtype: np.dtype) -> tp.Optional[np.dtype]:
-    '''Given a common UFunc and dtype, return the expected return dtype, or None if not possible.
-    '''
-    rt = UFUNC_MAP.get(func, None)
 
+def ufunc_to_category(
+    func: tp.Union[TUFunc, partial[TUFunc]],
+) -> tp.Optional[UFuncCategory]:
+    if func.__class__ is partial:
+        # std, var partialed
+        func = func.func  # type: ignore
+    return UFUNC_MAP.get(func, None)
+
+
+def ufunc_dtype_to_dtype(func: TUFunc, dtype: TDtypeAny) -> tp.Optional[TDtypeAny]:
+    """Given a common TUFunc and dtype, return the expected return dtype, or None if not possible."""
+    rt = ufunc_to_category(func)
     if rt is None:
         return None
 
     if rt is UFuncCategory.BOOL:
         if dtype == DTYPE_OBJECT:
-            return None # an object array returns a value from the array
+            return None  # an object array returns a value from the array
         return DTYPE_BOOL
 
     if rt is UFuncCategory.SELECTION:
         if dtype == DTYPE_OBJECT:
-            return None # cannot be sure
+            return None  # cannot be sure
         else:
             return dtype
 
     if rt is UFuncCategory.SUMMING:
         if dtype == DTYPE_OBJECT:
-            return None # cannot be sure
+            return None  # cannot be sure
         if dtype == DTYPE_BOOL or dtype.kind in DTYPE_INT_KINDS:
             return DTYPE_INT_DEFAULT
         if dtype.kind in DTYPE_INEXACT_KINDS:
             if func is sum:
                 if dtype.kind == DTYPE_COMPLEX_KIND:
-                    return DTYPE_COMPLEX_DEFAULT
+                    if dtype.itemsize <= DTYPE_COMPLEX_DEFAULT.itemsize:
+                        return DTYPE_COMPLEX_DEFAULT
+                    return dtype
                 if dtype.kind == DTYPE_FLOAT_KIND:
-                    return DTYPE_FLOAT_DEFAULT
-            return dtype # keep same size
+                    if dtype.itemsize <= DTYPE_FLOAT_DEFAULT.itemsize:
+                        return DTYPE_FLOAT_DEFAULT
+                    return dtype
+            return dtype  # keep same size
 
     if rt is UFuncCategory.STATISTICAL:
         if dtype == DTYPE_OBJECT or dtype == DTYPE_BOOL:
@@ -450,7 +1023,7 @@ def ufunc_dtype_to_dtype(func: UFunc, dtype: np.dtype) -> tp.Optional[np.dtype]:
             if func in (np.std, np.nanstd, np.var, np.nanvar):
                 if dtype.kind == DTYPE_COMPLEX_KIND:
                     return DTYPE_FLOAT_DEFAULT
-            return dtype # keep same size
+            return dtype  # keep same size
 
     if rt is UFuncCategory.CUMMULATIVE:
         if dtype == DTYPE_OBJECT:
@@ -460,12 +1033,76 @@ def ufunc_dtype_to_dtype(func: UFunc, dtype: np.dtype) -> tp.Optional[np.dtype]:
         elif dtype.kind in DTYPE_INT_KINDS:
             return DTYPE_INT_DEFAULT
         elif dtype.kind in DTYPE_INEXACT_KINDS:
-            return dtype # keep same size
+            return dtype  # keep same size
 
     return None
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
+TVFGItem = tp.TypeVar('TVFGItem')
+
+
+class FrozenGenerator:
+    """
+    A wrapper of an iterator (or iterable) that stores values iterated for later recall; this never iterates the iterator unbound, but always iterates up to a target.
+    """
+
+    __slots__ = (
+        '_gen',
+        '_src',
+    )
+
+    def __init__(self, gen: tp.Iterable[TVFGItem]):
+        # NOTE: while generally called with an iterator, some iterables such as dict_values need to be converted to an iterator
+        self._gen: tp.Iterator[TVFGItem]
+        if hasattr(gen, '__next__'):
+            self._gen = gen  # type: ignore
+        else:
+            self._gen = iter(gen)
+        self._src: tp.List[TVFGItem] = []
+
+    def __getitem__(self, key: int) -> TVFGItem:  # type: ignore
+        start = len(self._src)
+        if key >= start:
+            for k in range(start, key + 1):
+                try:
+                    self._src.append(next(self._gen))
+                except StopIteration:
+                    raise IndexError(k) from None
+        return self._src[key]  # type: ignore
+
+
+# -------------------------------------------------------------------------------
+# This is overspecified for Windows..
+TMpContext: tp.TypeAlias = tp.Literal['fork', 'forkserver', 'spawn'] | None
+
+
+def get_concurrent_executor(
+    *,
+    use_threads: bool,
+    max_workers: tp.Optional[int],
+    mp_context: TMpContext,
+) -> tp.Type[Executor]:
+    # NOTE: these imports are conditional as these modules are not supported in pyodide
+    exe: tp.Callable[..., Executor]
+    if use_threads:
+        from concurrent.futures import ThreadPoolExecutor
+
+        exe = partial(ThreadPoolExecutor, max_workers=max_workers)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        exe = partial(
+            ProcessPoolExecutor,
+            max_workers=max_workers,
+            mp_context=mp.get_context(mp_context),
+        )  # pyright: ignore
+    return exe  # type: ignore
+
+
+# -------------------------------------------------------------------------------
 # join utils
+
 
 class Join(Enum):
     INNER = 0
@@ -473,16 +1110,36 @@ class Join(Enum):
     RIGHT = 2
     OUTER = 3
 
-class Pair(tuple): #type: ignore
-    pass
 
-class PairLeft(Pair):
-    pass
+# -------------------------------------------------------------------------------
 
-class PairRight(Pair):
-    pass
 
-#-------------------------------------------------------------------------------
+def bytes_to_size_label(size_bytes: int) -> str:
+    if size_bytes == 0:
+        return '0 B'
+    size_name = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
+    i = math.floor(math.log(size_bytes, 1024))
+    p = math.pow(1024, i)
+    s: tp.Union[int, float]
+    if size_name[i] == 'B':
+        s = size_bytes
+    else:
+        s = round(size_bytes / p, 2)
+    return f'{s} {size_name[i]}'
+
+
+# -------------------------------------------------------------------------------
+
+_T = tp.TypeVar('_T', bound=TLabel)
+
+
+def frozenset_filter(src: tp.Iterable[_T]) -> tp.FrozenSet[_T]:
+    """
+    Return a frozenset of `src` if not already a frozenset.
+    """
+    if isinstance(src, frozenset):
+        return src
+    return frozenset(src)
 
 
 # def mloc(array: np.ndarray) -> int:
@@ -501,7 +1158,7 @@ class PairRight(Pair):
 #     return src_array # keep it as is
 
 
-# def name_filter(name: NameType) -> NameType:
+# def name_filter(name: TName) -> TName:
 #     '''
 #     For name attributes on containers, only permit recursively hashable objects.
 #     '''
@@ -568,15 +1225,17 @@ class PairRight(Pair):
 #             yield v
 #         last = v
 
-def _gen_skip_middle(
-        forward_iter: CallableToIterType,
-        forward_count: int,
-        reverse_iter: CallableToIterType,
-        reverse_count: int,
-        center_sentinel: tp.Any) -> tp.Iterator[tp.Any]:
-    '''
+
+def gen_skip_middle(
+    forward_iter: TCallableToIter,
+    forward_count: int,
+    reverse_iter: TCallableToIter,
+    reverse_count: int,
+    center_sentinel: tp.Any,
+) -> tp.Iterator[tp.Any]:
+    """
     Provide a generator to yield the count values from each side.
-    '''
+    """
     assert forward_count > 0 and reverse_count > 0
     # for the forward gen, we take one more column to serve as the center column ellipsis; thus, we start enumeration at 0
     for idx, value in enumerate(forward_iter(), start=1):
@@ -595,20 +1254,20 @@ def _gen_skip_middle(
 
 
 def dtype_from_element(
-        value: tp.Any,
-        ) -> np.dtype:
-    '''Given an arbitrary hashable to be treated as an element, return the appropriate dtype. This was created to avoid using np.array(value).dtype, which for a Tuple does not return object.
-    '''
-    if value is np.nan:
+    value: tp.Any,
+) -> TDtypeAny:
+    """Given an arbitrary hashable to be treated as an element, return the appropriate dtype. This was created to avoid using np.array(value).dtype, which for a Tuple does not return object."""
+    if value is np.nan:  # noqa: PLW0177
         # NOTE: this will not catch all NaN instances, but will catch any default NaNs in function signatures that reference the same NaN object found on the NP root namespace
         return DTYPE_FLOAT_DEFAULT
     if value is None:
         return DTYPE_OBJECT
     # we want to match np.array elements; they have __len__ but it raises when called
     if value.__class__ is np.ndarray and value.ndim == 0:
-        return value.dtype
+        return value.dtype  # type: ignore
     # all arrays, or SF containers, should be treated as objects when elements
-    if hasattr(value, '__len__') and not isinstance(value, str):
+    # NOTE: might check for __iter__?
+    if hasattr(value, '__len__') and not isinstance(value, STRING_TYPES):
         return DTYPE_OBJECT
     # NOTE: calling array and getting dtype on np.nan is faster than combining isinstance, isnan calls
     return np.array(value).dtype
@@ -682,56 +1341,153 @@ def dtype_from_element(
 #     return dt_resolve
 
 
-
 def concat_resolved(
-        arrays: tp.Iterable[np.ndarray],
-        axis: int = 0,
-        ) -> np.ndarray:
-    '''
-    Concatenation of 2D arrays that uses resolved dtypes to avoid truncation.
+    arrays: tp.Iterable[TNDArrayAny],
+    axis: int = 0,
+) -> TNDArrayAny:
+    """
+    Concatenation of 1D or 2D arrays that uses resolved dtypes to avoid truncation. Both axis are supported.
 
     Axis 0 stacks rows (extends columns); axis 1 stacks columns (extends rows).
 
     No shape manipulation will happen, so it is always assumed that all dimensionalities will be common.
-    '''
-    #all the input array dimensions except for the concatenation axis must match exactly
+    """
     if axis is None:
         raise NotImplementedError('no handling of concatenating flattened arrays')
 
-    # first pass to determine shape and resolved type
-    arrays_iter = iter(arrays)
-    first = next(arrays_iter)
+    arrays_seq: tp.Sequence[TNDArrayAny]
+    if not hasattr(arrays, '__len__'):  # a generator
+        arrays_seq = list(arrays)
+    else:
+        arrays_seq = arrays  # type: ignore
 
-    # ndim = first.ndim
-    dt_resolve = first.dtype
-    shape = list(first.shape)
+    shape: tp.Sequence[int]
+    if len(arrays_seq) == 2:  # assume we have a sequence
+        # faster path when we have two in a sequence
+        a1, a2 = arrays_seq
+        dt_resolve = resolve_dtype(a1.dtype, a2.dtype)
+        size = a1.shape[axis] + a2.shape[axis]
+        if a1.ndim == 1:
+            shape = (size,)
+        else:
+            shape = (size, a1.shape[1]) if axis == 0 else (a1.shape[0], size)
+    else:  # first pass to determine shape and resolved type
+        arrays_iter = iter(arrays_seq)
+        first = next(arrays_iter)
+        dt_resolve = first.dtype
+        shape = list(first.shape)
 
-    for array in arrays_iter:
-        if dt_resolve != DTYPE_OBJECT:
-            dt_resolve = resolve_dtype(array.dtype, dt_resolve)
-        shape[axis] += array.shape[axis]
+        for array in arrays_iter:
+            if dt_resolve != DTYPE_OBJECT:
+                dt_resolve = resolve_dtype(array.dtype, dt_resolve)
+            shape[axis] += array.shape[axis]
 
-    out = np.empty(shape=shape, dtype=dt_resolve)
-    np.concatenate(arrays, out=out, axis=axis)
+    out: TNDArrayAny = np.empty(shape=shape, dtype=dt_resolve)
+    np.concatenate(arrays_seq, out=out, axis=axis)
     out.flags.writeable = False
     return out
 
 
+def blocks_to_array_2d(
+    blocks: tp.Iterable[TNDArrayAny],  # can be iterator
+    shape: tp.Optional[tp.Tuple[int, int]] = None,
+    dtype: tp.Optional[TDtypeAny] = None,
+) -> TNDArrayAny:
+    """
+    Given an iterable of blocks, return a consolidatd array. This is assumed to be an axis 1 style concatenation.
+    This is equivalent but more efficient than:
+        TypeBlocks.from_blocks(blocks).values
+    """
+    discover_dtype = dtype is None
+    discover_shape = shape is None
+    blocks_is_gen = not hasattr(blocks, '__len__')
+    blocks_post: TOptionalArrayList = None
+
+    if discover_shape or discover_dtype:
+        # if we have to discover shape or types, we have to do two iterations, and then must load an iterator of `blocks` into a list
+        if blocks_is_gen:
+            blocks_post = []
+
+        if discover_shape:
+            rows = -1
+            columns = 0
+
+        for b in blocks:
+            if discover_shape:
+                if rows == -1:
+                    rows = len(b)  # works for 1D and 2D
+                elif len(b) != rows:
+                    raise RuntimeError(f'Invalid block shape {len(b)}')
+                if b.ndim == 1:
+                    columns += 1
+                else:
+                    columns += b.shape[1]
+            if discover_dtype:
+                if dtype is None:
+                    dtype = b.dtype
+                elif dtype != DTYPE_OBJECT:
+                    dtype = resolve_dtype(dtype, b.dtype)
+            if blocks_post is not None:
+                blocks_post.append(b)
+
+        if discover_shape:
+            shape = (rows, columns)  # if discover_shape else shape
+
+    if blocks_post is None:
+        # blocks might be an iterator if we did not need to discover shape or dtype
+        if not blocks_is_gen and len(blocks) == 1:  # type: ignore
+            return column_2d_filter(blocks[0])  # type: ignore
+        blocks_post = blocks  # type: ignore
+    elif len(blocks_post) == 1:
+        # blocks_post is filled; block might be 1d so use filter
+        return column_2d_filter(blocks_post[0])
+
+    # NOTE: this is an axis 1 np.concatenate with known shape, dtype
+    array: TNDArrayAny = np.empty(shape, dtype=dtype)
+    pos = 0
+    if dtype == DTYPE_OBJECT:
+        for b in blocks_post:  # type: ignore
+            if not is_objectable(b):
+                # NOTE: this wastes a copy, but saves element-wise assignment
+                b = astype_array(b, DTYPE_OBJECT)
+            if b.ndim == 1:
+                array[NULL_SLICE, pos] = b
+                pos += 1
+            else:
+                end = pos + b.shape[1]
+                array[NULL_SLICE, pos:end] = b
+                pos = end
+    else:
+        for b in blocks_post:  # type: ignore
+            if b.ndim == 1:
+                array[NULL_SLICE, pos] = b
+                pos += 1
+            else:
+                end = pos + b.shape[1]
+                array[NULL_SLICE, pos:end] = b
+                pos = end
+
+    array.flags.writeable = False
+    return array
+
+
 def full_for_fill(
-        dtype: tp.Optional[np.dtype],
-        shape: tp.Union[int, tp.Tuple[int, ...]],
-        fill_value: object,
-        resolve_fill_value_dtype: bool = True,
-        ) -> np.ndarray:
-    '''
+    dtype: tp.Optional[TDtypeAny],
+    shape: tp.Union[int, tp.Tuple[int, ...]],
+    fill_value: object,
+    resolve_fill_value_dtype: bool = True,
+) -> TNDArrayAny:
+    """
     Return a "full" NP array for the given fill_value
     Args:
         dtype: target dtype, which may or may not be possible given the fill_value. This can be set to None to only use the fill_value to determine dtype.
-    '''
+    """
     # NOTE: this will treat all no-str iterables as
     if resolve_fill_value_dtype:
         dtype_element = dtype_from_element(fill_value)
-        dtype_final = dtype_element if dtype is None else resolve_dtype(dtype, dtype_element)
+        dtype_final = (
+            dtype_element if dtype is None else resolve_dtype(dtype, dtype_element)
+        )
     else:
         assert dtype is not None
         dtype_final = dtype
@@ -741,12 +1497,12 @@ def full_for_fill(
         return np.full(shape, fill_value, dtype=dtype_final)
 
     # for tuples and other objects, better to create and fill
-    array = np.empty(shape, dtype=DTYPE_OBJECT)
+    array: TNDArrayAny = np.empty(shape, dtype=DTYPE_OBJECT)
     if fill_value is None:
-        return array # None is already set for empty object arrays
+        return array  # None is already set for empty object arrays
 
     # if we have a generator, None, string, or other simple types, can directly assign
-    if isinstance(fill_value, str) or not hasattr(fill_value, '__len__'):
+    if isinstance(fill_value, STRING_TYPES) or not hasattr(fill_value, '__len__'):
         array[NULL_SLICE] = fill_value
     else:
         for iloc in np.ndindex(shape):
@@ -755,9 +1511,8 @@ def full_for_fill(
     return array
 
 
-def dtype_to_fill_value(dtype: DtypeSpecifier) -> tp.Any:
-    '''Given a dtype, return an appropriate and compatible null value. This used to provide temporary, "dummy" fill values that reduce type coercions.
-    '''
+def dtype_to_fill_value(dtype: TDtypeSpecifier) -> tp.Any:
+    """Given a dtype, return an appropriate and compatible null value. This is used to provide temporary, "dummy" fill values that reduce type coercions."""
     if not isinstance(dtype, np.dtype):
         # we permit things like object, float, etc.
         dtype = np.dtype(dtype)
@@ -765,7 +1520,7 @@ def dtype_to_fill_value(dtype: DtypeSpecifier) -> tp.Any:
     kind = dtype.kind
 
     if kind in DTYPE_INT_KINDS:
-        return 0 # cannot support NaN
+        return 0  # cannot support NaN
     if kind == DTYPE_BOOL_KIND:
         return False
     if kind in DTYPE_INEXACT_KINDS:
@@ -780,9 +1535,9 @@ def dtype_to_fill_value(dtype: DtypeSpecifier) -> tp.Any:
         return EMPTY_TIMEDELTA
     raise NotImplementedError('no support for this dtype', kind)
 
+
 def dtype_kind_to_na(kind: str) -> tp.Any:
-    '''Given a dtype kind, return an a NA value to do the least invasive type coercion.
-    '''
+    """Given a dtype kind, return an a NA value to do the least invasive type coercion."""
     if kind in DTYPE_INEXACT_KINDS:
         return np.nan
     if kind in DTYPE_INT_KINDS:
@@ -792,65 +1547,195 @@ def dtype_kind_to_na(kind: str) -> tp.Any:
         return NAT
     return None
 
+
 def array_ufunc_axis_skipna(
-        array: np.ndarray,
-        *,
-        skipna: bool,
-        axis: int,
-        ufunc: UFunc,
-        ufunc_skipna: UFunc,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    '''For ufunc array application, when two ufunc versions are available. Expected to always reduce dimensionality.
-    '''
+    array: TNDArrayAny,
+    *,
+    skipna: bool,
+    axis: int,
+    ufunc: TUFunc,
+    ufunc_skipna: TUFunc,
+    out: tp.Optional[TNDArrayAny] = None,
+) -> tp.Any:
+    """For ufunc array application, when two ufunc versions are available. Expected to always reduce dimensionality."""
     kind = array.dtype.kind
-    if kind in DTYPE_NUMERICABLE_KINDS:
+    if kind in DTYPE_NUMERICABLE_KINDS or kind == 'M' or kind == 'm':
         v = array
     elif kind == 'O':
         # replace None with nan
         if skipna:
-            is_not_none = np.not_equal(array, None)
+            is_not_none: TNDArrayAny = np.not_equal(array, None)  # type: ignore
 
         if array.ndim == 1:
             if skipna:
                 v = array[is_not_none]
-                if len(v) == 0: # all values were None
+                if len(v) == 0:  # all values were None
                     return np.nan
             else:
                 v = array
         else:
             # for 2D array, replace None with NaN
             if skipna:
-                v = array.copy() # already an object type
-                v[~is_not_none] = np.nan
+                v = array.copy()  # already an object type
+                v[~is_not_none] = np.nan  # pyright: ignore
             else:
                 v = array
-
-    elif kind == 'M' or kind == 'm':
-        # dates do not support skipna functions
-        return ufunc(array, axis=axis, out=out)
-
     elif kind in DTYPE_STR_KINDS and ufunc in UFUNC_AXIS_STR_TO_OBJ:
         v = array.astype(object)
-    else: # normal string dtypes
+    else:  # normal string dtypes
         v = array
 
     if skipna:
         return ufunc_skipna(v, axis=axis, out=out)
     return ufunc(v, axis=axis, out=out)
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
 # unique value discovery; based on NP's arraysetops.py
 
-def ufunc_unique1d(array: np.ndarray) -> np.ndarray:
-    '''
-    Find the unique elements of an array, ignoring shape. Optimized from NumPy implementation based on assumption of 1D array.
-    '''
+
+def argsort_array(
+    array: TNDArrayAny,
+    kind: TSortKinds = DEFAULT_STABLE_SORT_KIND,
+) -> TNDArrayIntDefault:
+    # NOTE: must use stable sort when returning positions
     if array.dtype.kind == 'O':
-        try: # some 1D object arrays are sortable
-            array = np.sort(array)
+        try:
+            return array.argsort(kind=kind)
+        except TypeError:  # if unorderable types
+            pass
+
+        array_sortable = np.empty(array.shape, dtype=DTYPE_INT_DEFAULT)
+
+        indices: tp.Dict[tp.Any, int] = {}
+        for i, v in enumerate(array):
+            array_sortable[i] = indices.setdefault(v, len(indices))
+        del indices
+
+        return np.argsort(array_sortable, kind=kind)
+
+    return array.argsort(kind=kind)
+
+
+# dtype kinds for which a stable argsort via hash-factorize + arraykit.group_ordering
+# (both O(n)) beats numpy's O(n log n) comparison sort while producing the identical
+# stable permutation. Integer and string win; bool (trivial), datetime (NaT), and
+# object (unsortable/NaN semantics) are left on the native sort. Float is deliberately
+# excluded: its *ordering* is exact (NaN sorts last, as in np.argsort), but continuous
+# float is typically near-unique (k ~= n), where hashing n values then sorting ~n
+# uniques regresses versus numpy's direct index sort -- the common sort_values case.
+_FACTORIZE_ARGSORT_KINDS = frozenset((*DTYPE_INT_KINDS, *DTYPE_STR_KINDS))
+# dtype kinds accelerated for *grouping* (offsets/boundaries). Includes float: unlike
+# sorting, group keys are typically low-cardinality (where factorize's sort of the few
+# uniques is cheap), and by design all NaN collapse into a single group (the pandas-like
+# semantic). datetime/object stay on the transition-based fallback.
+_FACTORIZE_GROUP_KINDS = frozenset((*DTYPE_INT_KINDS, *DTYPE_STR_KINDS, DTYPE_FLOAT_KIND))
+
+
+def factorize_group_ordering(
+    array: TNDArrayAny,
+    kind: TSortKinds = DEFAULT_STABLE_SORT_KIND,
+) -> tp.Optional[tp.Tuple[TNDArrayAny, TNDArrayAny]]:
+    """For a factorizable 1D array with a stable ``kind``, return ``(ordering, offsets)``
+    from ``factorize`` + ``arraykit.group_ordering``: the stable grouping permutation and
+    the group-boundary offsets (group ``g`` occupies ``ordering[offsets[g]:offsets[g+1]]``).
+    Returns ``None`` for dtypes not accelerated (datetime/object, or a non-stable kind),
+    so the caller falls back to a comparison sort with transition-based grouping.
+
+    Float is accepted (group keys are typically low-cardinality, where factorize beats
+    the comparison sort, and offsets come free); all NaN collapse into a single group.
+    """
+    if kind == DEFAULT_SORT_KIND and array.dtype.kind in _FACTORIZE_GROUP_KINDS:
+        uniques, codes = factorize(array, sort=True)
+        return group_ordering(codes, size=len(uniques))
+    return None
+
+
+def factorize_argsort(
+    array: TNDArrayAny,
+    kind: TSortKinds = DEFAULT_STABLE_SORT_KIND,
+) -> TNDArrayAny:
+    """Stable argsort ordering of a 1D array.
+
+    For integer and string/bytes dtypes with a stable ``kind``, computed via
+    hash-factorize plus ``arraykit.group_ordering`` (an O(n) counting sort of the
+    dense codes). This yields the identical stable permutation to
+    ``np.argsort(array, kind)`` but replaces the O(n log n) comparison sort with two
+    O(n) passes. All other dtypes (float/datetime/object/bool) and non-stable kinds
+    fall through to ``np.argsort`` unchanged.
+    """
+    if kind == DEFAULT_SORT_KIND and array.dtype.kind in _FACTORIZE_ARGSORT_KINDS:
+        uniques, codes = factorize(array, sort=True)
+        return group_ordering(codes, size=len(uniques))[0]
+    return np.argsort(array, kind=kind)
+
+
+def factorize_group_ordering_2d(
+    columns: tp.Sequence[TNDArrayAny],
+    kind: TSortKinds = DEFAULT_STABLE_SORT_KIND,
+) -> tp.Optional[tp.Tuple[TNDArrayAny, TNDArrayAny]]:
+    """Multi-column grouping partition: factorize each column, radix-combine the
+    per-column codes (first column highest weight, matching the lexicographic order
+    of ``np.lexsort``), then ``group_ordering`` the densified combined code. Returns
+    ``(ordering, offsets)`` or ``None`` when a column is not NaN-free factorizable or
+    the combined cardinality would overflow int64 (caller falls back to lexsort).
+    """
+    if kind != DEFAULT_SORT_KIND:
+        return None
+    n = len(columns[0])
+    col_codes: tp.List[tp.Tuple[TNDArrayAny, int]] = []
+    for col in columns:
+        if col.dtype.kind not in _FACTORIZE_GROUP_KINDS:
+            return None
+        uniques, codes = factorize(col, sort=True)
+        col_codes.append((codes.astype(np.int64), len(uniques)))
+
+    # mixed-radix multipliers, first column highest weight (primary sort key)
+    multipliers = [1] * len(col_codes)
+    total = 1
+    for i in range(len(col_codes) - 1, -1, -1):
+        multipliers[i] = total
+        total *= col_codes[i][1]
+        if total >= 2**63:  # combined cardinality overflows the int64 code
+            return None
+
+    combined = np.zeros(n, dtype=np.int64)
+    for (codes, _), mult in zip(col_codes, multipliers):
+        combined += codes * mult
+
+    # densify the (possibly sparse) combined code, then order it
+    uniques_c, codes_c = factorize(combined, sort=True)
+    return group_ordering(codes_c, size=len(uniques_c))
+
+
+def factorize_lexsort(
+    values_for_lex: tp.Iterable[TNDArrayAny],
+    kind: TSortKinds = DEFAULT_STABLE_SORT_KIND,
+) -> tp.Optional[TNDArrayAny]:
+    """Ordering identical to ``np.lexsort(values_for_lex)`` (the *last* array is the
+    primary key), computed via the factorize radix of ``factorize_group_ordering_2d``.
+    Returns ``None`` when a key is not int/str, the combined cardinality would overflow
+    int64, or ``kind`` is non-stable -- caller falls back to lexsort.
+    """
+    cols = list(values_for_lex)
+    # sorting excludes float: continuous float is near-unique, where factorize's sort of
+    # ~n uniques regresses versus np.lexsort. (Grouping, by contrast, admits float.)
+    if any(c.dtype.kind not in _FACTORIZE_ARGSORT_KINDS for c in cols):
+        return None
+    # np.lexsort takes the primary key last; the 2d radix wants it first
+    partition = factorize_group_ordering_2d(cols[::-1], kind)
+    return None if partition is None else partition[0]
+
+
+def ufunc_unique1d(array: TNDArrayAny) -> TNDArrayAny:
+    """
+    Find the unique elements of an array, ignoring shape. Optimized from NumPy implementation based on assumption of 1D array.
+    """
+    if array.dtype.kind == 'O':
+        try:  # some 1D object arrays are sortable
+            array = np.sort(array, kind=DEFAULT_FAST_SORT_KIND)
             sortable = True
-        except TypeError: # if unorderable types
+        except TypeError:  # if unorderable types
             sortable = False
         if not sortable:
             # Use a dict to retain order; this will break for non hashables
@@ -859,31 +1744,35 @@ def ufunc_unique1d(array: np.ndarray) -> np.ndarray:
             array[:] = tuple(store)
             return array
     else:
-        array = np.sort(array)
+        array = np.sort(array, kind=DEFAULT_FAST_SORT_KIND)
 
     mask = np.empty(array.shape, dtype=DTYPE_BOOL)
-    mask[:1] = True
+    mask[:1] = True  # using a slice handles empty mask case
     mask[1:] = array[1:] != array[:-1]
 
-    return array[mask]
+    array = array[mask]
+    array.flags.writeable = False
+    return array
 
 
-def ufunc_unique1d_indexer(array: np.ndarray,
-        ) -> tp.Tuple[np.ndarray, np.ndarray]:
-    '''
-    Find the unique elements of an array. Optimized from NumPy implementation based on assumption of 1D array. Returns unique values as well as index positions of those values in the original array.
-    '''
-    if array.dtype.kind == 'O':
-        try:
-            positions = array.argsort()
-            sortable = True
-        except TypeError: # if unorderable types
-            sortable = False
-        # if not sortable, we cannot do anything else but a string
-        if not sortable:
-            positions = array.astype(str).argsort()
-    else:
-        positions = array.argsort()
+def ufunc_unique1d_indexer(
+    array: TNDArrayAny,
+) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    """
+    Find the unique elements of an array. Returns the unique values (sorted) as
+    well as, for each element of the original array, the index position of its
+    value within the unique values (an inverse indexer).
+    """
+    if array.dtype.kind in DTYPE_FACTORIZABLE_KINDS:
+        # no NaN/NaT/None possible: hash-factorize is an exact O(n) replacement for
+        # the argsort below, yielding the same sorted uniques and inverse indexer
+        # (int64 codes == DTYPE_INT_DEFAULT; both outputs already immutable).
+        return factorize(array, sort=True)
+
+    # float/complex/object/datetime: keep the sort-based path, which treats each
+    # NaN/NaT/None as a distinct singleton (Index construction depends on this).
+    positions = argsort_array(array)
+
     # get the sorted array
     array = array[positions]
 
@@ -891,30 +1780,36 @@ def ufunc_unique1d_indexer(array: np.ndarray,
     mask[:1] = True
     mask[1:] = array[1:] != array[:-1]
 
-    indexer = np.empty(mask.shape, dtype=np.intp)
+    values = array[mask]  # get unique values
+    values.flags.writeable = False
+    if len(values) <= 1:  # we have only one item
+        return values, np.full(mask.shape, 0, dtype=DTYPE_INT_DEFAULT)
+
+    indexer = np.empty(mask.shape, dtype=DTYPE_INT_DEFAULT)
     indexer[positions] = np.cumsum(mask) - 1
+    indexer.flags.writeable = False
 
-    return array[mask], indexer
+    return values, indexer
 
-def ufunc_unique1d_positions(array: np.ndarray,
-        ) -> tp.Tuple[np.ndarray, np.ndarray]:
-    '''
-    Find the unique elements of an array. Optimized from NumPy implementation based on assumption of 1D array. Does not return the unqiue values, but the positions in the original index of those values, as well as the locations of the unique values.
-    '''
-    # NOTE: must use stable sort when returning positions
-    if array.dtype.kind == 'O':
-        try:
-            positions = array.argsort(kind=DEFAULT_STABLE_SORT_KIND)
-            sortable = True
-        except TypeError: # if unorderable types
-            sortable = False
-        if not sortable:
-            # NOTE: using string here could lead to None, 'None' being evaluated the same;  could repalce values with tuples of value as string, type as string, but that might also have collisions
-            positions = array.astype(str).argsort(kind=DEFAULT_STABLE_SORT_KIND)
-    else:
-        positions = array.argsort(kind=DEFAULT_STABLE_SORT_KIND)
+
+def ufunc_unique1d_positions(
+    array: TNDArrayAny,
+) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    """
+    Find the unique elements of an array. Optimized from NumPy implementation based on assumption of 1D array. Does not return the unique values, but the positions in the original index of those values, as well as the locations of the unique values.
+    """
+    if array.dtype.kind in DTYPE_FACTORIZABLE_KINDS:
+        # no NaN/NaT/None possible: hash-factorize gives sorted uniques and the inverse
+        # indexer (codes), and group_ordering's per-group offsets locate the (stable)
+        # first occurrence of each value in the original array -- all O(n).
+        uniques, codes = factorize(array, sort=True)
+        ordering, offsets = group_ordering(codes, size=len(uniques))
+        # first_positions must stay writeable: callers sort it in place
+        return ordering[offsets[:-1]], codes
+
+    positions = argsort_array(array)
+
     array = array[positions]
-
 
     mask = np.empty(array.shape, dtype=DTYPE_BOOL)
     mask[:1] = True
@@ -922,32 +1817,135 @@ def ufunc_unique1d_positions(array: np.ndarray,
 
     indexer = np.empty(mask.shape, dtype=np.intp)
     indexer[positions] = np.cumsum(mask) - 1
+    indexer.flags.writeable = False
 
     return positions[mask], indexer
 
 
-def view_2d_as_1d(array: np.ndarray) -> np.ndarray:
-    '''Given a 2D array, reshape it as a consolidated 1D arrays
-    '''
+# NOTE: ufunc_unique1d_counts is currently unused (no non-test callers). It is retained
+# here, commented out, in case a future value_counts-style path needs it. If resurrected,
+# re-add ``Counter`` to the ``collections`` import.
+# def ufunc_unique1d_counts(
+#     array: TNDArrayAny,
+# ) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+#     """
+#     Find the unique elements of an array. Optimized from NumPy implementation based on assumption of 1D array. Returns unique values as well as the counts of those unique values from the original array.
+#     """
+#     if array.dtype.kind in DTYPE_FACTORIZABLE_KINDS:
+#         # no NaN/NaT/None possible: hash-factorize gives sorted uniques directly and
+#         # bincount of the dense codes gives their counts (aligned to the sorted uniques),
+#         # both O(n) -- no full value sort.
+#         uniques, codes = factorize(array, sort=True)
+#         # counts left writeable to match the original np.diff-based return contract
+#         return uniques, np.bincount(codes)
+#
+#     if array.dtype.kind == 'O':
+#         try:  # some 1D object arrays are sortable
+#             array = np.sort(array, kind=DEFAULT_STABLE_SORT_KIND)
+#             sortable = True
+#         except TypeError:  # if unorderable types
+#             sortable = False
+#
+#         if not sortable:
+#             # Use a dict to retain order; this will break for non hashables
+#             store: tp.Dict[TLabel, int] = Counter(array)
+#
+#             counts = np.empty(len(store), dtype=DTYPE_INT_DEFAULT)
+#             array = np.empty(len(store), dtype=DTYPE_OBJECT)
+#
+#             counts[NULL_SLICE] = tuple(store.values())
+#             array[NULL_SLICE] = tuple(store)
+#
+#             return array, counts
+#     else:
+#         array = np.sort(array, kind=DEFAULT_STABLE_SORT_KIND)
+#
+#     mask = np.empty(array.shape, dtype=DTYPE_BOOL)
+#     mask[:1] = True
+#     mask[1:] = array[1:] != array[:-1]
+#
+#     pos = nonzero_1d(mask)
+#     index_of_last_occurrence = np.empty(len(pos) + 1, dtype=pos.dtype)
+#     index_of_last_occurrence[:-1] = pos
+#     index_of_last_occurrence[-1] = mask.size
+#
+#     return array[mask], np.diff(index_of_last_occurrence)
+
+
+def ufunc_unique_enumerated(
+    array: TNDArrayAny,
+    *,
+    retain_order: bool = False,
+    func: tp.Optional[tp.Callable[[tp.Any], bool]] = None,
+) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    # see doc_str.unique_enumerated
+
+    is_2d = array.ndim == 2
+    if not is_2d and array.ndim != 1:
+        raise ValueError('Only 1D and 2D arrays supported.')
+
+    if not retain_order and not func:
+        if is_2d:
+            uniques, indexer = ufunc_unique1d_indexer(array.flatten(order='F'))
+        else:
+            uniques, indexer = ufunc_unique1d_indexer(array)
+    else:
+        indexer = np.empty(array.size, dtype=DTYPE_INT_DEFAULT)
+        indices: tp.Dict[tp.Any, int] = {}
+
+        eiter: tp.Iterator[tp.Tuple[int, tp.Any]]
+        if is_2d:
+            # NOTE: force F ordering so 2D arrays observe order by column; this returns array elements that need to be converted to Python objects with item()
+            eiter = (
+                (i, e.item())  # type: ignore
+                for i, e in enumerate(np.nditer(array, order='F', flags=('refs_ok',)))
+            )
+        else:
+            eiter = enumerate(array)
+
+        if not func:
+            for i, v in eiter:
+                indexer[i] = indices.setdefault(v, len(indices))
+        else:
+            for i, v in eiter:
+                if func(v):
+                    indexer[i] = -1
+                else:
+                    indexer[i] = indices.setdefault(v, len(indices))
+
+        if array.dtype != DTYPE_OBJECT:
+            uniques = np.fromiter(indices.keys(), count=len(indices), dtype=array.dtype)
+        else:
+            uniques = np.array(list(indices.keys()), dtype=DTYPE_OBJECT)
+
+    if is_2d:
+        indexer = indexer.reshape(array.shape, order='F')
+
+    return indexer, uniques
+
+
+def view_2d_as_1d(array: TNDArrayAny) -> TNDArrayAny:
+    """Given a 2D array, reshape it as a consolidated 1D arrays"""
     assert array.ndim == 2
     if not array.flags.c_contiguous:
         array = np.ascontiguousarray(array)
     # NOTE: this could be cached
     dtype = [(f'f{i}', array.dtype) for i in range(array.shape[1])]
-    return array.view(dtype)[NULL_SLICE, 0] # get 1D representation
+    return array.view(dtype)[NULL_SLICE, 0]
 
 
-def ufunc_unique2d(array: np.ndarray,
-        axis: int = 0,
-    ) -> np.ndarray:
-    '''
+def ufunc_unique2d(
+    array: TNDArrayAny,
+    axis: int = 0,
+) -> TNDArrayAny:
+    """
     Optimized from NumPy implementation.
-    '''
+    """
     if array.dtype.kind == 'O':
         if axis == 0:
-            array_iter = array2d_to_tuples(array)
+            array_iter = array_to_tuple_iter(array)
         else:
-            array_iter = array2d_to_tuples(array.T)
+            array_iter = array_to_tuple_iter(array.T)
         # Use a dict to retain order; this will break for non hashables
         # NOTE: could try to sort tuples and do matching, but might fail comparison
         store = dict.fromkeys(array_iter)
@@ -961,18 +1959,19 @@ def ufunc_unique2d(array: np.ndarray,
 
     consolidated = view_2d_as_1d(array)
     values = ufunc_unique1d(consolidated)
-    values = values.view(array.dtype).reshape(-1, array.shape[1]) # restore dtype, shape
+    values = values.view(array.dtype).reshape(-1, array.shape[1])  # restore dtype, shape
     if axis == 1:
         return values.T
     return values
 
 
-def ufunc_unique2d_indexer(array: np.ndarray,
-        axis: int = 0,
-        ) -> tp.Tuple[np.ndarray, np.ndarray]:
-    '''
+def ufunc_unique2d_indexer(
+    array: TNDArrayAny,
+    axis: int = 0,
+) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    """
     Find the unique elements of an array and provide an indexer that shows their locations in the original.
-    '''
+    """
     if axis == 1:
         array = array.T
 
@@ -980,7 +1979,7 @@ def ufunc_unique2d_indexer(array: np.ndarray,
         # we must convert to string in order to extract positions data
         consolidated = view_2d_as_1d(array.astype(str))
         positions, indexer = ufunc_unique1d_positions(consolidated)
-        values = array[positions] # restore original values
+        values = array[positions]  # restore original values
 
     else:
         consolidated = view_2d_as_1d(array)
@@ -993,30 +1992,29 @@ def ufunc_unique2d_indexer(array: np.ndarray,
 
 
 def ufunc_unique(
-        array: np.ndarray,
-        *,
-        axis: tp.Optional[int] = None,
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny,
+    *,
+    axis: tp.Optional[int] = None,
+) -> TNDArrayAny:
+    """
     Extended functionality of the np.unique ufunc, to handle cases of mixed typed objects, where NP will fail in finding unique values for a heterogenous object type.
 
     Args:
 
-    '''
+    """
     if axis is None and array.ndim == 2:
-        return ufunc_unique1d(array.flatten())
+        return ufunc_unique1d(
+            array.reshape(-1)
+        )  # reshape over flatten return a view if possible
     elif array.ndim == 1:
         return ufunc_unique1d(array)
-    return ufunc_unique2d(array, axis=axis)
+    return ufunc_unique2d(array, axis=axis)  # type: ignore
 
 
-
-def roll_1d(array: np.ndarray,
-            shift: int
-            ) -> np.ndarray:
-    '''
+def roll_1d(array: TNDArrayAny, shift: int) -> TNDArrayAny:
+    """
     Specialized form of np.roll that, by focusing on the 1D solution, is at least four times faster.
-    '''
+    """
     size = len(array)
     if size <= 1:
         return array.copy()
@@ -1026,23 +2024,19 @@ def roll_1d(array: np.ndarray,
     if shift == 0:
         return array.copy()
 
-    post = np.empty(size, dtype=array.dtype)
-
+    post: TNDArrayAny = np.empty(size, dtype=array.dtype)
     post[0:shift] = array[-shift:]
     post[shift:] = array[0:-shift]
     return post
 
 
-def roll_2d(array: np.ndarray,
-            shift: int,
-            axis: int
-            ) -> np.ndarray:
-    '''
+def roll_2d(array: TNDArrayAny, shift: int, axis: int) -> TNDArrayAny:
+    """
     Specialized form of np.roll that, by focusing on the 2D solution
-    '''
-    post = np.empty(array.shape, dtype=array.dtype)
+    """
+    post: TNDArrayAny = np.empty(array.shape, dtype=array.dtype)
 
-    if axis == 0: # roll rows
+    if axis == 0:  # roll rows
         size = array.shape[0]
         if size <= 1:
             return array.copy()
@@ -1052,11 +2046,11 @@ def roll_2d(array: np.ndarray,
         if shift == 0:
             return array.copy()
 
-        post[0:shift, :] = array[-shift:, :]
-        post[shift:, :] = array[0:-shift, :]
+        post[0:shift, NULL_SLICE] = array[-shift:, NULL_SLICE]
+        post[shift:, NULL_SLICE] = array[0:-shift, NULL_SLICE]
         return post
 
-    elif axis == 1: # roll columns
+    elif axis == 1:  # roll columns
         size = array.shape[1]
         if size <= 1:
             return array.copy()
@@ -1066,23 +2060,25 @@ def roll_2d(array: np.ndarray,
         if shift == 0:
             return array.copy()
 
-        post[:, 0:shift] = array[:, -shift:]
-        post[:, shift:] = array[:, 0:-shift]
+        post[NULL_SLICE, 0:shift] = array[NULL_SLICE, -shift:]
+        post[NULL_SLICE, shift:] = array[NULL_SLICE, 0:-shift]
         return post
 
     raise NotImplementedError()
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
+
 
 def _argminmax_1d(
-        array: np.ndarray,
-        ufunc: UFunc,
-        ufunc_skipna: UFunc,
-        skipna: bool = True,
-        ) -> tp.Any: # tp.Union[int, float]:
-    '''
+    array: TNDArrayAny,
+    ufunc: TUFunc,
+    ufunc_skipna: TUFunc,
+    skipna: bool = True,
+) -> tp.Any:  # tp.Union[int, float]:
+    """
     Perform argmin or argmax, handling NaN as needed.
-    '''
+    """
     # always need to to check for nans, even if skipna is False, as np will raise if all NaN, and will not return Nan if there skipna is false
     isna = isna_array(array)
 
@@ -1103,20 +2099,20 @@ argmax_1d = partial(_argminmax_1d, ufunc=np.argmax, ufunc_skipna=np.nanargmax)
 
 
 def _argminmax_2d(
-        array: np.ndarray,
-        ufunc: UFunc,
-        ufunc_skipna: UFunc,
-        skipna: bool = True,
-        axis: int = 0
-        ) -> np.ndarray: # int or float array
-    '''
+    array: TNDArrayAny,
+    ufunc: TUFunc,
+    ufunc_skipna: TUFunc,
+    skipna: bool = True,
+    axis: int = 0,
+) -> TNDArrayAny:  # int or float array
+    """
     Perform argmin or argmax, handling NaN as needed.
-    '''
+    """
     # always need to to check for nans, even if skipna is False, as np will raise if all NaN, and will not return Nan if there skipna is false
     isna = isna_array(array)
 
     isna_axis = isna.any(axis=axis)
-    if isna_axis.all(): # nan in every axis remaining position
+    if isna_axis.all():  # nan in every axis remaining position
         if not skipna:
             return np.full(isna_axis.shape, np.nan, dtype=DTYPE_FLOAT_DEFAULT)
 
@@ -1124,24 +2120,25 @@ def _argminmax_2d(
         # always use skipna ufunc if any NaNs are present, as otherwise the wrong indices are returned when a nan is encountered (rather than a nan)
         post = ufunc_skipna(array, axis=axis)
         if not skipna:
-            post = post.astype(DTYPE_FLOAT_DEFAULT  )
+            post = post.astype(DTYPE_FLOAT_DEFAULT)
             post[isna_axis] = np.nan
         return post
 
     return ufunc(array, axis=axis)
 
+
 argmin_2d = partial(_argminmax_2d, ufunc=np.argmin, ufunc_skipna=np.nanargmin)
 argmax_2d = partial(_argminmax_2d, ufunc=np.argmax, ufunc_skipna=np.nanargmax)
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # array constructors
 
 
 def is_gen_copy_values(values: tp.Iterable[tp.Any]) -> tp.Tuple[bool, bool]:
-    '''
+    """
     Returns:
         copy_values: True if values cannot be used in an np.array constructor.
-    '''
+    """
     is_gen = not hasattr(values, '__len__')
     copy_values = is_gen
     if not is_gen:
@@ -1154,86 +2151,37 @@ def is_gen_copy_values(values: tp.Iterable[tp.Any]) -> tp.Tuple[bool, bool]:
 
 
 def prepare_iter_for_array(
-        values: tp.Iterable[tp.Any],
-        restrict_copy: bool = False
-        ) -> tp.Tuple[DtypeSpecifier, bool, tp.Sequence[tp.Any]]:
-    '''
-    Determine an appropriate DtypeSpecifier for values in an iterable. This does not try to determine the actual dtype, but instead, if the DtypeSpecifier needs to be object rather than None (which lets NumPy auto detect). This is expected to only operate on 1D data.
+    values: tp.Iterable[tp.Any], restrict_copy: bool = False
+) -> tp.Tuple[TDtypeSpecifier, bool, tp.Sequence[tp.Any]]:
+    """
+    Determine an appropriate TDtypeSpecifier for values in an iterable. This does not try to determine the actual dtype, but instead, if the TDtypeSpecifier needs to be object rather than None (which lets NumPy auto detect). This is expected to only operate on 1D data.
 
     Args:
         values: can be a generator that will be exhausted in processing; if a generator, a copy will be made and returned as values.
         restrict_copy: if True, reject making a copy, even if a generator is given
     Returns:
         resolved, has_tuple, values
-    '''
+    """
 
     is_gen, copy_values = is_gen_copy_values(values)
 
-    if not is_gen and len(values) == 0: #type: ignore
-        return None, False, values #type: ignore
+    if not is_gen and len(values) == 0:  # type: ignore
+        return None, False, values  # type: ignore
 
     if restrict_copy:
         copy_values = False
 
-    v_iter = values if is_gen else iter(values)
-
-    if copy_values:
-        values_post = []
-
-    resolved = None # None is valid specifier if the type is not ambiguous
-
-    has_tuple = False
-    has_str = False
-    has_non_str = False
-    has_inexact = False
-    has_big_int = False
-
-    for v in v_iter:
-        if copy_values:
-            # if a generator, have to make a copy while iterating
-            values_post.append(v)
-
-        value_type = v.__class__
-
-        if (value_type is str
-                or value_type is np.str_
-                or value_type is bytes
-                or value_type is np.bytes_):
-            # must compare to both string types
-            has_str = True
-        elif hasattr(v, '__len__'):
-            # identify SF types, lists, or tuples
-            has_tuple = True
-            resolved = object
-            break
-        elif isinstance(v, Enum):
-            # must check isinstance, as Enum types are always derived from Enum
-            resolved = object
-            break
-        else:
-            has_non_str = True
-            if value_type in INEXACT_TYPES:
-                has_inexact = True
-            elif value_type is int and abs(v) > INT_MAX_COERCIBLE_TO_FLOAT:
-                has_big_int = True
-
-        if (has_str and has_non_str) or (has_big_int and has_inexact):
-            resolved = object
-            break
-
-    if copy_values:
-        # v_iter is an iter, we need to finish it
-        values_post.extend(v_iter)
-        return resolved, has_tuple, values_post
-    return resolved, has_tuple, values #type: ignore
+    # delegate the per-element inspection (and, when copy_values, materialization)
+    # to the arraykit C implementation, which returns (resolved, has_tuple, values)
+    return ak_prepare_iter_for_array(values, copy_values)
 
 
 def iterable_to_array_1d(
-        values: tp.Iterable[tp.Any],
-        dtype: DtypeSpecifier = None,
-        count: tp.Optional[int] = None,
-        ) -> tp.Tuple[np.ndarray, bool]:
-    '''
+    values: tp.Iterable[tp.Any],
+    dtype: TDtypeSpecifier = None,
+    count: tp.Optional[int] = None,
+) -> tp.Tuple[TNDArrayAny, bool]:
+    """
     Convert an arbitrary Python iterable to a 1D NumPy array without any undesirable type coercion.
 
     Args:
@@ -1241,32 +2189,38 @@ def iterable_to_array_1d(
 
     Returns:
         pair of array, Boolean, where the Boolean can be used when necessary to establish uniqueness.
-    '''
-    dtype = None if dtype is None else np.dtype(dtype) # convert dtype specifier to a dtype
+    """
+    dtype = (
+        None if dtype is None else np.dtype(dtype)
+    )  # convert dtype specifier to a dtype
 
     if values.__class__ is np.ndarray:
-        if values.ndim != 1: #type: ignore
+        if values.ndim != 1:
             raise RuntimeError('expected 1d array')
-        if dtype is not None and dtype != values.dtype: #type: ignore
+        if dtype is not None and dtype != values.dtype:
             raise RuntimeError(f'Supplied dtype {dtype} not set on supplied array.')
-        return values, len(values) <= 1 #type: ignore
+        return values, len(values) <= 1
 
     if values.__class__ is range:
         # translate range to np.arange to avoid iteration
-        array = np.arange(start=values.start, #type: ignore
-                stop=values.stop, #type: ignore
-                step=values.step, #type: ignore
-                dtype=dtype)
+        array = np.arange(  # type: ignore
+            start=values.start,
+            stop=values.stop,
+            step=values.step,
+            dtype=dtype,
+        )
         array.flags.writeable = False
         return array, True
 
     if hasattr(values, 'values') and hasattr(values, 'index'):
-        raise RuntimeError(f'Supplied iterable {type(values)} appears to be labeled, though labels are ignored in this context. Convert to an array.')
+        raise RuntimeError(
+            f'Supplied iterable {type(values)} appears to be labeled, though labels are ignored in this context. Convert to an array.'
+        )
 
     values_for_construct: tp.Sequence[tp.Any]
 
     # values for construct will only be a copy when necessary in iteration to find type
-    if isinstance(values, str):
+    if isinstance(values, STRING_TYPES):
         # if a we get a single string, it is an iterable of characters, but if given to NumPy will produce an array of a single element; here, we convert it to an iterable of a single element; let dtype argument (if passed or None) be used in creation, below
         has_tuple = False
         values_for_construct = (values,)
@@ -1274,18 +2228,18 @@ def iterable_to_array_1d(
         # this returns as dtype only None, or object, letting array constructor do the rest
         dtype, has_tuple, values_for_construct = prepare_iter_for_array(values)
         if len(values_for_construct) == 0:
-            return EMPTY_ARRAY, True # no dtype given, so return empty float array
-    else: # dtype is provided
+            return EMPTY_ARRAY, True  # no dtype given, so return empty float array
+    else:  # dtype is provided
         is_gen, copy_values = is_gen_copy_values(values)
-
         if is_gen and count and dtype.kind not in DTYPE_STR_KINDS:
             if dtype.kind != DTYPE_OBJECT_KIND:
                 # if dtype is int this might raise OverflowError
-                array = np.fromiter(values,
-                        count=count,
-                        dtype=dtype,
-                        )
-            else: # object dtypes
+                array = np.fromiter(
+                    values,
+                    count=count,
+                    dtype=dtype,
+                )
+            else:  # object dtypes
                 array = np.empty(count, dtype=dtype)
                 for i, element in enumerate(values):
                     array[i] = element
@@ -1296,14 +2250,14 @@ def iterable_to_array_1d(
             # we have to realize into sequence for numpy creation
             values_for_construct = tuple(values)
         else:
-            values_for_construct = values #type: ignore
+            values_for_construct = values  # type: ignore
 
         if len(values_for_construct) == 0:
             # dtype was given, return an empty array with that dtype
-            v = np.empty(0, dtype=dtype)
-            v.flags.writeable = False
-            return v, True
-        #as we have not iterated iterable, assume that there might be tuples if the dtype is object
+            ve = np.empty(0, dtype=dtype)
+            ve.flags.writeable = False
+            return ve, True
+        # as we have not iterated iterable, assume that there might be tuples if the dtype is object
         has_tuple = dtype == DTYPE_OBJECT
 
     if len(values_for_construct) == 1 or isinstance(values, DICTLIKE_TYPES):
@@ -1333,21 +2287,23 @@ def iterable_to_array_1d(
 
 
 def iterable_to_array_2d(
-        values: tp.Iterable[tp.Iterable[tp.Any]],
-        ) -> np.ndarray:
-    '''
+    values: tp.Iterable[tp.Iterable[tp.Any]],
+) -> TNDArrayAny:
+    """
     Convert an arbitrary Python iterable of iterables to a 2D NumPy array without any undesirable type coercion. Useful IndexHierarchy construction.
 
     Returns:
         pair of array, Boolean, where the Boolean can be used when necessary to establish uniqueness.
-    '''
+    """
     if values.__class__ is np.ndarray:
-        if values.ndim != 2: #type: ignore
+        if values.ndim != 2:
             raise RuntimeError('expected 2d array')
         return values
 
     if hasattr(values, 'values') and hasattr(values, 'index'):
-        raise RuntimeError(f'Supplied iterable {type(values)} appears to be labeled, though labels are ignored in this context. Convert to an array.')
+        raise RuntimeError(
+            f'Supplied iterable {type(values)} appears to be labeled, though labels are ignored in this context. Convert to an array.'
+        )
 
     # consume values into a tuple
     if not hasattr(values, '__len__'):
@@ -1355,32 +2311,31 @@ def iterable_to_array_2d(
 
     # if we provide whole generator to prepare_iter_for_array, it will copy the entire sequence unless restrict copy is True
     dtype, _, _ = prepare_iter_for_array(
-            (y for z in values for y in z),
-            restrict_copy=True
-            )
+        (y for z in values for y in z), restrict_copy=True
+    )
 
-    array = np.array(values, dtype=dtype)
+    array: TNDArrayAny = np.array(values, dtype=dtype)
     if array.ndim != 2:
         raise RuntimeError('failed to convert iterable to 2d array')
 
     array.flags.writeable = False
     return array
 
-def iterable_to_array_nd(
-        values: tp.Any,
-        ) -> np.ndarray:
-    '''
-    Attempt to determine if a value is 0, 1, or 2D array; this will interpret lists of tuples as 2D, as NumPy does.
-    '''
-    if hasattr(values, '__iter__') and not isinstance(values, str):
 
+def iterable_to_array_nd(
+    values: tp.Any,
+) -> TNDArrayAny:
+    """
+    Attempt to determine if a value is 0, 1, or 2D array; this will interpret lists of tuples as 2D, as NumPy does.
+    """
+    if hasattr(values, '__iter__') and not isinstance(values, STRING_TYPES):
         values = iter(values)
         try:
             first = next(values)
         except StopIteration:
             return EMPTY_ARRAY
 
-        if hasattr(first, '__iter__') and not isinstance(first, str):
+        if hasattr(first, '__iter__') and not isinstance(first, STRING_TYPES):
             return iterable_to_array_2d(chain((first,), values))
 
         array, _ = iterable_to_array_1d(chain((first,), values))
@@ -1388,56 +2343,91 @@ def iterable_to_array_nd(
     # its an element
     return np.array(values)
 
-#-------------------------------------------------------------------------------
 
-def slice_to_ascending_slice(
-        key: slice,
-        size: int
-        ) -> slice:
-    '''
-    Given a slice, return a slice that, with ascending integers, covers the same values.
+# -------------------------------------------------------------------------------
 
-    Args:
-        size: the length of the container on this axis
-    '''
-    # NOTE: a slice can have start > stop, and None as step: should that case be handled here?
-    key_step = key.step
-    key_start = key.start
-    key_stop = key.stop
+# def slice_to_ascending_slice(
+#         key: slice,
+#         size: int
+#         ) -> slice:
+#     '''
+#     Given a slice, return a slice that, with ascending integers, covers the same values.
 
-    if key_step is None or key_step > 0:
+#     Args:
+#         size: the length of the container on this axis
+#     '''
+#     key_step = key.step
+#     key_start = key.start
+#     key_stop = key.stop
+
+#     if key_step is None or key_step > 0:
+#         return key
+
+#     # will get rid of all negative values greater than the size; but will replace None with an appropriate number for usage in range
+#     norm_key_start, norm_key_stop, norm_key_step = key.indices(size)
+
+#     # everything else should be descending, but we might have non-descending start, stop
+#     if key_start is not None and key_stop is not None:
+#         if norm_key_start <= norm_key_stop: # an ascending range
+#             return EMPTY_SLICE
+
+#     norm_range = range(norm_key_start, norm_key_stop, norm_key_step)
+
+#     # derive stop
+#     if key_start is None:
+#         stop = None
+#     else:
+#         stop = norm_range[0] + 1
+
+#     if key_step == -1:
+#         # gets last realized value, not last range value
+#         return slice(None if key_stop is None else norm_range[-1], stop, 1)
+
+#     return slice(norm_range[-1], stop, key_step * -1)
+
+
+def pos_loc_slice_to_iloc_slice(
+    key: slice,
+    length: int,
+) -> slice:
+    """Make a positional (integer) exclusive stop key inclusive by adding one to the stop value."""
+    if key == NULL_SLICE:
         return key
 
-    stop = key_start if key_start is None else key_start + 1
+    # NOTE: we are not validating that this is an integer here
+    start = None if key.start is None else key.start
 
-    if key_step == -1:
-        # if 6, 1, -1, then
-        start = key_stop if key_stop is None else key_stop + 1
-        return slice(start, stop, 1)
-
-    step = abs(key_step)
-    start = size - 1 if key_start is None else min(size - 1, key_start)
-
-    if key_stop is None:
-        start = start - (step * (start // step))
+    if key.stop is None:
+        stop = None
     else:
-        start = start - (step * ((start - key_stop - 1) // step))
+        try:
+            if key.stop >= length:
+                # while a valid slice of positions, loc lookups do not permit over-stating boundaries
+                raise LocInvalid(f'Invalid loc: {key}')
+        except TypeError as e:  # if stop is not an int
+            raise LocInvalid(f'Invalid loc: {key}') from e
 
-    return slice(start, stop, step)
-
-def slice_to_inclusive_slice(
-        key: slice,
-        offset: int = 0,
-        ) -> slice:
-    '''Make a stop exclusive key inclusive by adding one to the stop value.
-    '''
-    start = None if key.start is None else key.start + offset
-    stop = None if key.stop is None else key.stop + 1 + offset
+        stop = key.stop + 1
     return slice(start, stop, key.step)
 
 
+def key_to_str(key: TLocSelector) -> str:
+    if key.__class__ is not slice:
+        return str(key)
+    if key == NULL_SLICE:
+        return ':'
 
-#-------------------------------------------------------------------------------
+    result = ':' if key.start is None else f'{key.start}:'
+
+    if key.stop is not None:
+        result += str(key.stop)
+    if key.step is not None and key.step != 1:
+        result += f':{key.step}'
+
+    return result
+
+
+# -------------------------------------------------------------------------------
 # dates
 
 DT64_YEAR = np.dtype('datetime64[Y]')
@@ -1463,85 +2453,116 @@ TD64_MS = np.timedelta64(1, 'ms')
 TD64_US = np.timedelta64(1, 'us')
 TD64_NS = np.timedelta64(1, 'ns')
 
-_DT_NOT_FROM_INT = (DT64_DAY, DT64_MONTH)
+DT_NOT_FROM_INT = (DT64_DAY, DT64_MONTH)  # year is handled separately
 
-DTU_PYARROW = set(('ns', 'D', 's'))
+DTU_PYARROW = frozenset(('ns', 'D', 's'))
+
 
 def to_datetime64(
-        value: DateInitializer,
-        dtype: tp.Optional[np.dtype] = None
-        ) -> np.datetime64:
-    '''
-    Convert a value ot a datetime64; this must be a datetime64 so as to be hashable.
-    '''
-    # for now, only support creating from a string, as creation from integers is based on offset from epoch
+    value: TDateInitializer, dtype: tp.Optional[TDtypeOrDT64] = None
+) -> np.datetime64:
+    """
+    Convert a value to a datetime64; this must be a datetime64 so as to be hashable.
+
+    Args:
+        dtype: Provide the expected dtype of the returned value.
+    """
+    dt: np.datetime64
     if not isinstance(value, np.datetime64):
+        if value == '':
+            raise ValueError('Implicit NaT creation not supported.')
         if dtype is None:
-            # let constructor figure it out
-            dt = np.datetime64(value)
-        else: # assume value is single value;
-            # note that integers will be converted to units from epoch
+            # let constructor figure it out; if value is an integer or unparsable it will raise
+            dt = np.datetime64(value)  # type: ignore
+        else:  # assume value is single value;
+            # integers will be converted to units from epoch
             if isinstance(value, INT_TYPES):
-                if dtype == DT64_YEAR:
-                    # convert to string as that is likely what is wanted
+                if dtype == DT64_YEAR:  # convert to string
                     value = str(value)
-                elif dtype in _DT_NOT_FROM_INT:
-                    raise RuntimeError('attempting to create {} from an integer, which is generally not desired as the result will be offset from the epoch.'.format(dtype))
+                elif dtype in DT_NOT_FROM_INT:
+                    raise InvalidDatetime64Initializer(
+                        f'Attempting to create {dtype} from an integer, which is generally not desired as the result will be an offset from the epoch.'
+                    )
             # cannot use the datetime directly
             if dtype != np.datetime64:
-                dt = np.datetime64(value, np.datetime_data(dtype)[0])
-            else: # cannot use a generic datetime type
-                dt = np.datetime64(value)
-    else: # if a dtype was explicitly given, check it
+                dt = np.datetime64(value, np.datetime_data(dtype)[0])  # type: ignore
+                # permit NaNs to pass
+                if not np.isnan(dt) and dtype == DT64_YEAR:
+                    dt_naive = np.datetime64(value)  # type: ignore
+                    if dt_naive.dtype != dt.dtype:
+                        raise InvalidDatetime64Initializer(
+                            f'value ({value}) will not be converted to dtype ({dtype})'
+                        )
+            else:  # cannot use a generic datetime type
+                dt = np.datetime64(value)  # type: ignore
+    else:  # if a dtype was explicitly given, check it
         # value is an instance of a datetime64, and has a dtype attr
         dt = value
         if dtype:
             # dtype can be either generic, or a matching specific dtype
             if dtype != np.datetime64 and dtype != dt.dtype:
-                raise RuntimeError(f'value ({dt}) is not a supported dtype ({dtype})')
+                raise InvalidDatetime64Initializer(
+                    f'value ({dt}) is not a supported dtype ({dtype})'
+                )
     return dt
 
+
 def to_timedelta64(value: datetime.timedelta) -> np.timedelta64:
-    '''
+    """
     Convert a datetime.timedelta into a NumPy timedelta64. This approach is better than using np.timedelta64(value), as that reduces all values to microseconds.
-    '''
-    return reduce(operator.add,
-        (np.timedelta64(getattr(value, attr), code) for attr, code in TIME_DELTA_ATTR_MAP if getattr(value, attr) > 0))
+    """
+    return reduce(
+        operator.add,
+        (
+            np.timedelta64(getattr(value, attr), code)
+            for attr, code in TIME_DELTA_ATTR_MAP
+            if getattr(value, attr) > 0
+        ),
+    )
 
 
-def datetime64_not_aligned(array: np.ndarray, other: np.ndarray) -> bool:
-    '''Return True if both arrays are dt64 and they are not aligned by unit. Used in property tests that must skip this condition.
-    '''
+def datetime64_not_aligned(array: TNDArrayAny, other: TNDArrayAny) -> bool:
+    """Return True if both arrays are dt64 and they are not aligned by unit. Used in property tests that must skip this condition."""
     array_is_dt64 = array.dtype.kind == DTYPE_DATETIME_KIND
     other_is_dt64 = other.dtype.kind == DTYPE_DATETIME_KIND
     if array_is_dt64 and other_is_dt64:
-        return np.datetime_data(array.dtype)[0] != np.datetime_data(other.dtype)[0] #type: ignore
+        return np.datetime_data(array.dtype)[0] != np.datetime_data(other.dtype)[0]
     return False
 
 
-def _slice_to_datetime_slice_args(key: slice,
-        dtype: tp.Optional[np.dtype] = None
-        ) -> tp.Iterator[tp.Optional[np.datetime64]]:
-    '''
+def timedelta64_not_aligned(array: TNDArrayAny, other: TNDArrayAny) -> bool:
+    """Return True if both arrays are dt64 and they are not aligned by unit. Used in property tests that must skip this condition."""
+    array_is_td64 = array.dtype.kind == DTYPE_TIMEDELTA_KIND
+    other_is_td64 = other.dtype.kind == DTYPE_TIMEDELTA_KIND
+    if array_is_td64 and other_is_td64:
+        return np.datetime_data(array.dtype)[0] != np.datetime_data(other.dtype)[0]
+    return False
+
+
+def _slice_to_datetime_slice_args(
+    key: slice, dtype: tp.Optional[TDtypeOrDT64] = None
+) -> tp.Iterator[tp.Optional[np.datetime64]]:
+    """
     Given a slice representing a datetime region, convert to arguments for a new slice, possibly using the appropriate dtype for conversion.
-    '''
+    """
     for attr in SLICE_ATTRS:
         value = getattr(key, attr)
         if value is None:
             yield None
-        elif attr == SLICE_STEP_ATTR:
+        elif attr is SLICE_STEP_ATTR:
             # steps are never transformed
             yield value
         else:
             yield to_datetime64(value, dtype=dtype)
 
+
 def key_to_datetime_key(
-        key: GetItemKeyType,
-        dtype: np.dtype = np.datetime64,
-        ) -> GetItemKeyType:
-    '''
+    key: TLocSelector,
+    dtype: TDtypeOrDT64 = np.datetime64,
+) -> TLocSelector:
+    """
     Given an get item key for a Date index, convert it to np.datetime64 representation.
-    '''
+    """
     if isinstance(key, slice):
         return slice(*_slice_to_datetime_slice_args(key, dtype=dtype))
 
@@ -1551,32 +2572,45 @@ def key_to_datetime_key(
     if isinstance(key, np.datetime64):
         return key
 
-    if isinstance(key, str):
+    if isinstance(key, STRING_TYPES):
+        return to_datetime64(key, dtype=dtype)  # type: ignore
+
+    if isinstance(key, INT_TYPES):
         return to_datetime64(key, dtype=dtype)
 
     if isinstance(key, np.ndarray):
         if key.dtype.kind == 'b' or key.dtype.kind == 'M':
             return key
+        if dtype == DT64_YEAR and key.dtype.kind in DTYPE_INT_KINDS:
+            key = key.astype(DTYPE_STR)
         return key.astype(dtype)
 
     if hasattr(key, '__len__'):
+        if dtype == DT64_YEAR:
+            return np.array([to_datetime64(v, dtype) for v in key], dtype=dtype)  # type: ignore
         # use dtype via array constructor to determine type; or just use datetime64 to parse to the passed-in representation
         return np.array(key, dtype=dtype)
 
-    if hasattr(key, '__next__'): # a generator-like
-        return np.array(tuple(key), dtype=dtype) #type: ignore
+    if hasattr(key, '__iter__'):  # a generator-like
+        if dtype == DT64_YEAR:
+            return np.array([to_datetime64(v, dtype) for v in key], dtype=dtype)  # pyright: ignore
+        return np.array(tuple(key), dtype=dtype)  # type: ignore
 
-    # for now, return key unaltered
+    # could be None
     return key
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
+
 
 def array_to_groups_and_locations(
-        array: np.ndarray,
-        unique_axis: tp.Optional[int] = 0,
-        ) -> tp.Tuple[np.ndarray, np.ndarray]:
-    '''Locations are index positions for each group.
-    '''
+    array: TNDArrayAny,
+    unique_axis: int = 0,
+) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    """Locations are index positions for each group.
+    Args:
+        unique_axis: only used if ndim > 1
+    """
     if array.ndim == 1:
         return ufunc_unique1d_indexer(array)
     return ufunc_unique2d_indexer(array, axis=unique_axis)
@@ -1595,13 +2629,15 @@ def array_to_groups_and_locations(
 #         pass
 #     return value is None
 
-def isna_array(array: np.ndarray,
-        include_none: bool = True,
-        ) -> np.ndarray:
-    '''Given an np.ndarray, return a Boolean array setting True for missing values.
+
+def isna_array(
+    array: TNDArrayAny,
+    include_none: bool = True,
+) -> TNDArrayAny:
+    """Given an np.ndarray, return a Boolean array setting True for missing values.
 
     Note: the returned array is not made immutable.
-    '''
+    """
     kind = array.dtype.kind
     # matches all floating point types
     if kind in DTYPE_INEXACT_KINDS:
@@ -1609,56 +2645,83 @@ def isna_array(array: np.ndarray,
     elif kind in DTYPE_NAT_KINDS:
         return np.isnat(array)
     # match everything that is not an object; options are: biufcmMOSUV
-    elif kind != 'O':
+    elif kind != DTYPE_OBJECT_KIND:
         return np.full(array.shape, False, dtype=DTYPE_BOOL)
-    # only check for None if we have an object type
-    # NOTE: this will not work for Frames contained within a Series
-    if include_none:
-        return np.not_equal(array, array) | np.equal(array, None)
-    return np.not_equal(array, array)
 
-def isfalsy_array(array: np.ndarray) -> np.ndarray:
-    '''
+    # only check for None if we have an object type
+    with WarningsSilent():
+        try:
+            if include_none:
+                return np.not_equal(array, array) | np.equal(array, None)  # type: ignore
+            return np.not_equal(array, array)
+        except ErrorNotTruthy:
+            pass
+
+    # no other option than to do elementwise evaluation
+    return np.fromiter(
+        (isna_element(e, include_none) for e in array),
+        dtype=DTYPE_BOOL,
+        count=len(array),
+    )
+
+
+def isfalsy_array(array: TNDArrayAny) -> TNDArrayAny:
+    """
     Return a Boolean array indicating the presence of Falsy or NA values.
 
     Args:
         array: 1D or 2D array.
-    '''
+    """
     # NOTE: compare to dtype_to_fill_value
     kind = array.dtype.kind
     # matches all floating point types
     if kind in DTYPE_INEXACT_KINDS:
-        return np.isnan(array) | (array == 0.0)
+        return np.isnan(array) | (array == 0.0)  # type: ignore
     elif kind == DTYPE_DATETIME_KIND:
         return np.isnat(array)
     elif kind == DTYPE_TIMEDELTA_KIND:
-        return np.isnat(array) | (array == EMPTY_TIMEDELTA)
+        return np.isnat(array) | (array == EMPTY_TIMEDELTA)  # type: ignore
     elif kind == DTYPE_BOOL_KIND:
-        return ~array # just invert
+        return ~array
     elif kind in DTYPE_STR_KINDS:
-        return array == ''
+        return array == ''  # type: ignore
     elif kind in DTYPE_INT_KINDS:
-        return array == 0 # faster to compare to integer
+        return array == 0  # type: ignore
     elif kind != 'O':
         return np.full(array.shape, False, dtype=DTYPE_BOOL)
 
     # NOTE: an ArrayKit implementation might out performthis
-    post = np.empty(array.shape, dtype=DTYPE_BOOL)
+    post: TNDArrayAny = np.empty(array.shape, dtype=DTYPE_BOOL)
     for coord, v in np.ndenumerate(array):
-        post[coord] = not bool(array[coord])
+        post[coord] = not bool(v)
     # or with NaN observations
     return post | np.not_equal(array, array)
 
 
-def arrays_equal(array: np.ndarray,
-        other: np.ndarray,
-        *,
-        skipna: bool,
-        ) -> bool:
-    '''
+def arrays_equal(
+    array: TNDArrayAny,
+    other: TNDArrayAny,
+    *,
+    skipna: bool,
+) -> bool:
+    """
     Given two arrays, determine if they are equal; support skipping Na comparisons and handling dt64
-    '''
-    if array.dtype.kind == DTYPE_DATETIME_KIND and other.dtype.kind == DTYPE_DATETIME_KIND:
+    """
+    if id(array) == id(other):
+        return True
+
+    if (
+        mloc(array) == mloc(other)
+        and array.shape == other.shape
+        and array.strides == other.strides
+    ):
+        # NOTE: this implements an TArraySignature check that will short-circuit. A columnar slice from a 2D array will always have a unique array id(); however, two slices from the same 2D array will have the same mloc, shape, and strides; we can identify those cases here
+        return True
+
+    if (
+        array.dtype.kind == DTYPE_DATETIME_KIND
+        and other.dtype.kind == DTYPE_DATETIME_KIND
+    ):
         if np.datetime_data(array.dtype)[0] != np.datetime_data(other.dtype)[0]:
             # do not permit True result between 2021 and 2021-01-01
             return False
@@ -1667,32 +2730,31 @@ def arrays_equal(array: np.ndarray,
         # FutureWarning: elementwise comparison failed; returning scalar instead...
         eq = array == other
 
+    # NOTE: remove when min numpy is 1.25
     # NOTE: will only be False, or an array
     if eq is False:
         return eq
 
     if skipna:
-        isna_both = (isna_array(array, include_none=False)
-                & isna_array(other, include_none=False))
+        isna_both = isna_array(array, include_none=False) & isna_array(
+            other, include_none=False
+        )
         eq[isna_both] = True
 
-    if not eq.all(): # avoid returning a NumPy Bool
+    if not eq.all():  # avoid returning a NumPy Bool
         return False
     return True
 
-def binary_transition(
-        array: np.ndarray,
-        axis: int = 0
-        ) -> np.ndarray:
-    '''
+
+def binary_transition(array: TNDArrayAny, axis: int = 0) -> TNDArrayAny:
+    """
     Given a Boolean 1D array, return the index positions (integers) at False values where that False was previously True, or will be True
 
     Returns:
         For a 1D input, a 1D array of integers; for a 2D input, a 1D object array of lists, where each position corresponds to a found index position. Returning a list is undesirable, but more efficient as a list will be neede for selection downstream.
-    '''
+    """
 
     if len(array) == 0:
-        # NOTE: on some platforms this may not be the same dtype as returned from np.nonzero
         return EMPTY_ARRAY_INT
 
     not_array = ~array
@@ -1700,12 +2762,12 @@ def binary_transition(
     if array.ndim == 1:
         # non-nan values that go (from left to right) to NaN
         target_sel_leading = (array ^ roll_1d(array, -1)) & not_array
-        target_sel_leading[-1] = False # wrap around observation invalid
+        target_sel_leading[-1] = False  # wrap around observation invalid
         # non-nan values that were previously NaN (from left to right)
         target_sel_trailing = (array ^ roll_1d(array, 1)) & not_array
-        target_sel_trailing[0] = False # wrap around observation invalid
+        target_sel_trailing[0] = False  # wrap around observation invalid
 
-        return np.nonzero(target_sel_leading | target_sel_trailing)[0]
+        return nonzero_1d(target_sel_leading | target_sel_trailing)
 
     elif array.ndim == 2:
         # if axis == 0, we compare rows going down/up, looking at column values
@@ -1717,16 +2779,16 @@ def binary_transition(
         # wrap around observation invalid
         if axis == 0:
             # process an entire row
-            target_sel_leading[-1, :] = False
-            target_sel_trailing[0, :] = False
+            target_sel_leading[-1, NULL_SLICE] = False
+            target_sel_trailing[0, NULL_SLICE] = False
         else:
             # process entire column
-            target_sel_leading[:, -1] = False
-            target_sel_trailing[:, 0] = False
+            target_sel_leading[NULL_SLICE, -1] = False
+            target_sel_trailing[NULL_SLICE, 0] = False
 
         # this dictionary could be very sparse compared to axis dimensionality
         indices_by_axis: tp.DefaultDict[int, tp.List[int]] = defaultdict(list)
-        for y, x in zip(*np.nonzero(target_sel_leading | target_sel_trailing)):
+        for y, x in zip(*np.nonzero(target_sel_leading | target_sel_trailing)):  # pyright: ignore
             if axis == 0:
                 # store many rows values for each column
                 indices_by_axis[x].append(y)
@@ -1734,76 +2796,77 @@ def binary_transition(
                 indices_by_axis[y].append(x)
 
         # if axis is 0, return column width, else return row height
-        post = np.empty(dtype=object, shape=array.shape[not axis])
+        post: TNDArrayAny = np.empty(dtype=DTYPE_OBJECT, shape=array.shape[not axis])
         for k, v in indices_by_axis.items():
             post[k] = v
-
         return post
 
     raise NotImplementedError(f'no handling for array with ndim: {array.ndim}')
 
-#-------------------------------------------------------------------------------
 
-def array_deepcopy(
-        array: np.ndarray,
-        memo: tp.Optional[tp.Dict[int, tp.Any]],
-        ) -> np.ndarray:
-    '''
-    Create a deepcopy of an array, handling memo lookup, insertion, and object arrays.
-    '''
-    ident = id(array)
-    if memo is not None and ident in memo:
-        return memo[ident]
+# -------------------------------------------------------------------------------
 
-    if array.dtype == DTYPE_OBJECT:
-        post = deepcopy(array, memo)
-    else:
-        post = array.copy()
+# def array_deepcopy(
+#         array: np.ndarray,
+#         memo: tp.Optional[tp.Dict[int, tp.Any]],
+#         ) -> np.ndarray:
+#     '''
+#     Create a deepcopy of an array, handling memo lookup, insertion, and object arrays.
+#     '''
+#     ident = id(array)
+#     if memo is not None and ident in memo:
+#         return memo[ident]
 
-    if post.ndim > 0:
-        post.flags.writeable = array.flags.writeable
+#     if array.dtype == DTYPE_OBJECT:
+#         post = deepcopy(array, memo)
+#     else:
+#         post = array.copy()
 
-    if memo is not None:
-        memo[ident] = post
-    return post
+#     if post.ndim > 0:
+#         post.flags.writeable = array.flags.writeable
 
-#-------------------------------------------------------------------------------
+#     if memo is not None:
+#         memo[ident] = post
+#     return post
+
+# -------------------------------------------------------------------------------
 # tools for handling duplicates
 
+
 def _array_to_duplicated_hashable(
-        array: np.ndarray,
-        axis: int = 0,
-        exclude_first: bool = False,
-        exclude_last: bool = False) -> np.ndarray:
-    '''
+    array: TNDArrayAny,
+    axis: int = 0,
+    exclude_first: bool = False,
+    exclude_last: bool = False,
+) -> TNDArrayAny:
+    """
     Algorithm for finding duplicates in unsortable arrays for hashables. This will always be an object array.
-    '''
+    """
     # np.unique fails under the same conditions that sorting fails, so there is no need to try np.unique: must go to set drectly.
     len_axis = array.shape[axis]
 
+    value_source: tp.Iterable[tp.Any]
     if array.ndim == 1:
         value_source = array
         to_hashable = None
     else:
         if axis == 0:
-            value_source = array # will iterate rows
+            value_source = array  # will iterate rows
         else:
             value_source = (array[:, i] for i in range(len_axis))
         # values will be arrays; must convert to tuples to make hashable
         to_hashable = tuple
 
-
-    is_dupe = np.full(len_axis, False)
+    is_dupe: TNDArrayAny = np.full(len_axis, False)
 
     # could exit early with a set, but would have to hash all array twice to go to set and dictionary
     # creating a list for each entry and tracking indices would be very expensive
 
-    unique_to_first: tp.Dict[tp.Hashable, int] = {} # value to first occurence
-    dupe_to_first: tp.Dict[tp.Hashable, int] = {}
-    dupe_to_last: tp.Dict[tp.Hashable, int] = {}
+    unique_to_first: tp.Dict[TLabel, int] = {}  # value to first occurence
+    dupe_to_first: tp.Dict[TLabel, int] = {}
+    dupe_to_last: tp.Dict[TLabel, int] = {}
 
     for idx, v in enumerate(value_source):
-
         if to_hashable:
             v = to_hashable(v)
 
@@ -1819,23 +2882,24 @@ def _array_to_duplicated_hashable(
             # always update last
             dupe_to_last[v] = idx
 
-    if exclude_last: # overwrite with False
+    if exclude_last:  # overwrite with False
         is_dupe[list(dupe_to_last.values())] = False
 
-    if not exclude_first: # add in first values
+    if not exclude_first:  # add in first values
         is_dupe[list(dupe_to_first.values())] = True
 
     return is_dupe
 
 
 def _array_to_duplicated_sortable(
-        array: np.ndarray,
-        axis: int = 0,
-        exclude_first: bool = False,
-        exclude_last: bool = False) -> np.ndarray:
-    '''
+    array: TNDArrayAny,
+    axis: int = 0,
+    exclude_first: bool = False,
+    exclude_last: bool = False,
+) -> TNDArrayAny:
+    """
     Algorithm for finding duplicates in sortable arrays. This may or may not be an object array, as some object arrays (those of compatible types) are sortable.
-    '''
+    """
     # based in part on https://stackoverflow.com/questions/11528078/determining-duplicate-values-in-an-array
     # https://stackoverflow.com/a/43033882/388739
     # indices to sort and sorted array
@@ -1850,12 +2914,12 @@ def _array_to_duplicated_sortable(
         # f_flags is True where there are duplicated values in the sorted array
         f_flags = array_sorted == roll_1d(array_sorted, 1)
     else:
-        if axis == 0: # sort rows
+        if axis == 0:  # sort rows
             # first should be last
             arg = [array[:, x] for x in range(array.shape[1] - 1, -1, -1)]
             o_idx = np.lexsort(arg)
             array_sorted = array[o_idx]
-        elif axis == 1: # sort columns
+        elif axis == 1:  # sort columns
             arg = [array[x] for x in range(array.shape[0] - 1, -1, -1)]
             o_idx = np.lexsort(arg)
             array_sorted = array[:, o_idx]
@@ -1876,6 +2940,7 @@ def _array_to_duplicated_sortable(
     # Index 0 should always exist, due to `.any()` behavior.
     f_flags[0] = np.False_
 
+    dupes: TNDArrayAny
     if exclude_first and not exclude_last:
         dupes = f_flags
     else:
@@ -1896,48 +2961,113 @@ def _array_to_duplicated_sortable(
     return dupes[r_idx]
 
 
+def _duplicated_from_codes(
+    codes: TNDArrayAny,
+    size: int,
+    exclude_first: bool,
+    exclude_last: bool,
+) -> TNDArrayAny:
+    """Given dense group codes (0..size-1) per position, return the duplicated mask. A
+    position is a duplicate when its group has more than one member; the first/last
+    occurrence exclusions come from ``group_ordering``'s stable per-group offsets.
+    """
+    is_dup: TNDArrayAny = np.bincount(codes, minlength=size)[codes] > 1
+    if exclude_first or exclude_last:
+        ordering, offsets = group_ordering(codes, size=size)
+        if exclude_first:
+            is_dup[ordering[offsets[:-1]]] = False
+        if exclude_last:
+            is_dup[ordering[offsets[1:] - 1]] = False
+    is_dup.flags.writeable = False
+    return is_dup
+
+
+def _array_to_duplicated_factorize(
+    array: TNDArrayAny,
+    exclude_first: bool,
+    exclude_last: bool,
+) -> TNDArrayAny:
+    """Duplicated-mask for a NaN-free 1D array via hash-factorize: O(n) hash instead
+    of the O(n log n) argsort of ``_array_to_duplicated_sortable``.
+    """
+    uniques, codes = factorize(array)  # sort order is irrelevant for the mask
+    return _duplicated_from_codes(codes, len(uniques), exclude_first, exclude_last)
+
+
+def _array_to_duplicated_factorize_2d(
+    array: TNDArrayAny,
+    exclude_first: bool,
+    exclude_last: bool,
+) -> TNDArrayAny:
+    """Duplicated-mask over the rows (axis 0) of a NaN-free 2D array. Factorize each
+    column and fold the per-column codes into a single dense row-code, re-densifying
+    after each column so the combined code never exceeds ``n`` distinct values (no radix
+    overflow). Equivalent to a lexsort of the rows, but O(n) per column.
+    """
+    uniques, combined = factorize(array[:, 0])  # sort order irrelevant for the mask
+    size = len(uniques)
+    for i in range(1, array.shape[1]):
+        uniques_i, codes_i = factorize(array[:, i])
+        # fold column i into the running code, then re-densify to bound its range
+        uniques, combined = factorize(combined * len(uniques_i) + codes_i)
+        size = len(uniques)
+    return _duplicated_from_codes(combined, size, exclude_first, exclude_last)
+
 
 def array_to_duplicated(
-        array: np.ndarray,
-        axis: int = 0,
-        exclude_first: bool = False,
-        exclude_last: bool = False,
-        ) -> np.ndarray:
-    '''Given a numpy array (1D or 2D), return a Boolean array along the specified axis that shows which values are duplicated. By default, all duplicates are indicated. For 2d arrays, axis 0 compares rows and returns a row-length Boolean array; axis 1 compares columns and returns a column-length Boolean array.
+    array: TNDArrayAny,
+    axis: int = 0,
+    exclude_first: bool = False,
+    exclude_last: bool = False,
+) -> TNDArrayAny:
+    """Given a numpy array (1D or 2D), return a Boolean array along the specified axis that shows which values are duplicated. By default, all duplicates are indicated. For 2d arrays, axis 0 compares rows and returns a row-length Boolean array; axis 1 compares columns and returns a column-length Boolean array.
 
     Args:
         exclude_first: Mark as True all duplicates except the first encountared.
         exclude_last: Mark as True all duplicates except the last encountared.
-    '''
+    """
+    # fast path: int/str/bool/float arrays factorize in O(n) (sort=False -> no near-
+    # unique penalty); repeated NaN are marked as duplicates (NaN collapse). object keeps
+    # the sort path. For 2D only axis 0 (row dedup) is accelerated: axis 1 combines
+    # shape[0] components per key, where the existing lexsort of the columns is fast.
+    if array.dtype.kind in _DUPLICATED_FACTORIZE_KINDS:
+        if array.ndim == 1:
+            return _array_to_duplicated_factorize(array, exclude_first, exclude_last)
+        if axis == 0 and array.shape[1] > 0:
+            return _array_to_duplicated_factorize_2d(array, exclude_first, exclude_last)
     try:
         return _array_to_duplicated_sortable(
-                array=array,
-                axis=axis,
-                exclude_first=exclude_first,
-                exclude_last=exclude_last
-                )
-    except TypeError: # raised if not sorted
+            array=array,
+            axis=axis,
+            exclude_first=exclude_first,
+            exclude_last=exclude_last,
+        )
+    except TypeError:  # raised if not sorted
         return _array_to_duplicated_hashable(
-                array=array,
-                axis=axis,
-                exclude_first=exclude_first,
-                exclude_last=exclude_last
-                )
+            array=array,
+            axis=axis,
+            exclude_first=exclude_first,
+            exclude_last=exclude_last,
+        )
 
 
-#-------------------------------------------------------------------------------
-def array_shift(*,
-        array: np.ndarray,
-        shift: int,
-        axis: int, # 0 is rows, 1 is columns
-        wrap: bool,
-        fill_value: tp.Any = np.nan) -> np.ndarray:
-    '''
+# -------------------------------------------------------------------------------
+
+
+def array_shift(
+    *,
+    array: TNDArrayAny,
+    shift: int,
+    axis: int,  # 0 is rows, 1 is columns
+    wrap: bool,
+    fill_value: tp.Any = np.nan,
+) -> TNDArrayAny:
+    """
     Apply an np-style roll to a 1D or 2D array; if wrap is False, fill values out-shifted values with fill_value.
 
     Args:
         fill_value: only used if wrap is False.
-    '''
+    """
 
     # works for all shapes
     if shift == 0 or array.shape[axis] == 0:
@@ -1949,7 +3079,7 @@ def array_shift(*,
         shift_mod = shift % -array.shape[axis]
 
     if (not wrap and shift == 0) or (wrap and shift_mod == 0):
-        # must copy so as not let caller mutate arguement
+        # must copy so as not let caller mutate argument
         return array.copy()
 
     if wrap:
@@ -1974,57 +3104,60 @@ def array_shift(*,
 
     return result
 
-def array2d_to_tuples(array: np.ndarray) -> tp.Iterator[tp.Tuple[tp.Any, ...]]:
-    yield from map(tuple, array)
 
-def array2d_to_array1d(array: np.ndarray) -> np.ndarray:
-    post = np.empty(array.shape[0], dtype=object)
-    for i, row in enumerate(array):
-        post[i] = tuple(row)
-    post.flags.writeable = False
-    return post
+# def array2d_to_tuples(array: TNDArrayAny) -> tp.Iterator[tp.Tuple[tp.Any, ...]]:
+#     yield from map(tuple, array)
 
-def array1d_to_last_contiguous_to_edge(array: np.ndarray) -> int:
-    '''
+# def array_to_tuple_array(array: TNDArrayAny) -> TNDArrayAny:
+#     post: TNDArrayAny = np.empty(array.shape[0], dtype=object)
+#     for i, row in enumerate(array):
+#         post[i] = tuple(row)
+#     post.flags.writeable = False
+#     return post
+
+
+def array1d_to_last_contiguous_to_edge(array: TNDArrayAny) -> int:
+    """
     Given a Boolean array, return the start index where of the last range, through to the end, of contiguous True values.
-    '''
+    """
     length = len(array)
     if len(array) == 0:
         return 1
-    if array[-1] == False: #pylint: disable=C0121
+    if array[-1] == False:
         # if last values is False, no contiguous region
         return length
     count = array.sum()
     # count will always be > 0, as all False will hae the last value as False, which is handled above
-    if count == length: # if all are true
+    if count == length:  # if all are true
         return 0
 
     transitions = np.empty(length, dtype=bool)
-    transitions[0] = False # first value not a transition
+    transitions[0] = False  # first value not a transition
     # compare current to previous; do not compare first
     np.not_equal(array[:-1], array[1:], out=transitions[1:])
-    # transition_idx must always contain at least one index from here
-    transition_idx: tp.Sequence[int] = np.nonzero(transitions)[0]
     # last element must be True, so there will always be one transition, and the last transition will mark the boundary of a contiguous region
-    return transition_idx[-1]
-
-    # NOTE: these checks are not necessary
-    # if array[last_idx:].all():
-    #     return last_idx
-    # return length
+    return first_true_1d(transitions, forward=False)
 
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # extension to union and intersection handling
 
+
+class ManyToOneType(Enum):
+    CONCAT = 0
+    UNION = 1
+    INTERSECT = 2
+    DIFFERENCE = 3
+
+
 def _ufunc_set_1d(
-        func: tp.Callable[[np.ndarray, np.ndarray], np.ndarray],
-        array: np.ndarray,
-        other: np.ndarray,
-        *,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    func: tp.Callable[[TNDArrayAny, TNDArrayAny], TNDArrayAny],
+    array: TNDArrayAny,
+    other: TNDArrayAny,
+    *,
+    assume_unique: bool = False,
+) -> TNDArrayAny:
+    """
     Peform 1D set operations. When possible, short-circuit comparison and return array with original order.
 
     NOTE: there are known issues with how NP handles NaN and NaT with set operations, for example:
@@ -2038,7 +3171,7 @@ def _ufunc_set_1d(
 
     Args:
         assume_unique: if arguments are assumed unique, can implement optional identity filtering, which retains order (un sorted) for opperands that are equal. This is important in numerous operations on the matching Indices where order should not be perterbed.
-    '''
+    """
     is_union = func is np.union1d
     is_intersection = func is np.intersect1d
     is_difference = func is np.setdiff1d
@@ -2047,17 +3180,18 @@ def _ufunc_set_1d(
         raise NotImplementedError('unexpected func', func)
 
     dtype = resolve_dtype(array.dtype, other.dtype)
+    post: TNDArrayAny
 
     # optimizations for empty arrays
     if is_intersection:
         if len(array) == 0 or len(other) == 0:
             # not sure what DTYPE is correct to return here
-            post = np.array(EMPTY_TUPLE, dtype=dtype)
+            post = np.array((), dtype=dtype)
             post.flags.writeable = False
             return post
     elif is_difference:
         if len(array) == 0:
-            post = np.array(EMPTY_TUPLE, dtype=dtype)
+            post = np.array((), dtype=dtype)
             post.flags.writeable = False
             return post
 
@@ -2087,7 +3221,7 @@ def _ufunc_set_1d(
             # if sizes are the same, the result of == is mostly a bool array; comparison to some arrays (e.g. string), will result in a single Boolean, but it will always be False
             if compare.__class__ is np.ndarray and compare.all(axis=None):
                 if is_difference:
-                    post = np.array(EMPTY_TUPLE, dtype=dtype)
+                    post = np.array((), dtype=dtype)
                     post.flags.writeable = False
                     return post
                 return array
@@ -2096,44 +3230,48 @@ def _ufunc_set_1d(
     other_is_str = other.dtype.kind in DTYPE_STR_KINDS
 
     if (array_is_str ^ other_is_str) or dtype.kind == 'O':
-        # NOTE: we convert applicable dt64 types to objects to permit date object to dt64 comparisons when  possible
-        if array_is_dt64 and np.datetime_data(array.dtype)[0] in DTYPE_OBJECTABLE_DT64_UNITS:
+        # NOTE: we convert applicable dt64 types to objects to permit date object to dt64 comparisons when possible
+        if array_is_dt64 and is_objectable_dt64(array):
             array = array.astype(DTYPE_OBJECT)
-        elif other_is_dt64 and np.datetime_data(other.dtype)[0] in DTYPE_OBJECTABLE_DT64_UNITS:
+        elif other_is_dt64 and is_objectable_dt64(other):
             # the case of both is handled above
             other = other.astype(DTYPE_OBJECT)
 
-        # NOTE: taking a frozenset of dt64 arrays does not force elements to date/datetime objects
-        if is_union:
-            result = frozenset(array) | frozenset(other)
-        elif is_intersection:
-            result = frozenset(array) & frozenset(other)
-        else:
-            result = frozenset(array).difference(frozenset(other))
+        # NOTE: taking a frozenset of dt64 arrays does not force elements to date/datetime objects, which is what we want here
+        with WarningsSilent():
+            # NOTE: dt64 element comparisons will warn about elementwise comparison, even those they are elements
+            if is_union:
+                result = frozenset(array) | frozenset(other)
+            elif is_intersection:
+                result = frozenset(array) & frozenset(other)
+            else:
+                result = frozenset(array).difference(frozenset(other))
+
         # NOTE: try to sort, as set ordering is not stable
         try:
-            result = sorted(result) #type: ignore
+            result = sorted(result)  # type: ignore
         except TypeError:
             pass
-        post, _ = iterable_to_array_1d(result, dtype) # return immutable array
+        post, _ = iterable_to_array_1d(result, dtype)  # return immutable array
         return post
 
     if is_union:
         post = func(array, other)
     else:
-        post = func(array, other, assume_unique=assume_unique) #type: ignore
+        post = func(array, other, assume_unique=assume_unique)  # type: ignore
 
     post.flags.writeable = False
     return post
 
+
 def _ufunc_set_2d(
-        func: tp.Callable[[np.ndarray, np.ndarray], np.ndarray],
-        array: np.ndarray,
-        other: np.ndarray,
-        *,
-        assume_unique: bool=False
-        ) -> np.ndarray:
-    '''
+    func: tp.Callable[[TNDArrayAny, TNDArrayAny], TNDArrayAny],
+    array: TNDArrayAny,
+    other: TNDArrayAny,
+    *,
+    assume_unique: bool = False,
+) -> TNDArrayAny:
+    """
     Peform 2D set operations. When possible, short-circuit comparison and return array with original order.
 
     Args:
@@ -2143,7 +3281,7 @@ def _ufunc_set_2d(
         assume_unique: if True, array operands are assumed unique and order is preserved for matching operands.
     Returns:
         Either a 2D array (if both operands are 2D), or a 1D object array of tuples (if one or both are 1d tuple arrays).
-    '''
+    """
     # NOTE: diversity if returned values may be a problem; likely should always return 2D array, or follow pattern that if both operands are 2D, a 2D array is returned
 
     is_union = func == np.union1d
@@ -2154,22 +3292,30 @@ def _ufunc_set_2d(
     if not (is_union or is_intersection or is_difference):
         raise NotImplementedError('unexpected func', func)
 
+    if is_2d:
+        cols = array.shape[1]
+        if cols != other.shape[1]:
+            raise RuntimeError(
+                'cannot perform set operation on arrays with different number of columns'
+            )
+
     # if either are object, or combination resovle to object, get object
     dtype = resolve_dtype(array.dtype, other.dtype)
+    post: TNDArrayAny
 
     # optimizations for empty arrays
-    if is_intersection: # intersection with empty
+    if is_intersection:  # intersection with empty
         if len(array) == 0 or len(other) == 0:
-            post = np.array(EMPTY_TUPLE, dtype=dtype)
+            post = np.array((), dtype=dtype)
             if is_2d:
-                post = post.reshape(0, 0)
+                post = post.reshape(0, cols)
             post.flags.writeable = False
             return post
     elif is_difference:
         if len(array) == 0:
-            post = np.array(EMPTY_TUPLE, dtype=dtype)
+            post = np.array((), dtype=dtype)
             if is_2d:
-                post = post.reshape(0, 0)
+                post = post.reshape(0, cols)
             post.flags.writeable = False
             return post
 
@@ -2190,14 +3336,14 @@ def _ufunc_set_2d(
                 compare = array == other
             # will not match a 2D array of integers and 1D array of tuples containing integers (would have to do a post-set comparison, but would loose order)
             if isinstance(compare, BOOL_TYPES) and compare:
-                arrays_are_equal = True #pragma: no cover
+                arrays_are_equal = True  # pragma: no cover
             elif isinstance(compare, np.ndarray) and compare.all(axis=None):
                 arrays_are_equal = True
             if arrays_are_equal:
                 if is_difference:
-                    post = np.array(EMPTY_TUPLE, dtype=dtype)
+                    post = np.array((), dtype=dtype)
                     if is_2d:
-                        post = post.reshape(0, 0)
+                        post = post.reshape(0, cols)
                     post.flags.writeable = False
                     return post
                 return array
@@ -2206,12 +3352,12 @@ def _ufunc_set_2d(
         # assume that 1D arrays arrays are arrays of tuples
         if array.ndim == 1:
             array_set = frozenset(array)
-        else: # assume row-wise comparison
+        else:  # assume row-wise comparison
             array_set = frozenset(tuple(row) for row in array)
 
         if other.ndim == 1:
             other_set = frozenset(other)
-        else: # assume row-wise comparison
+        else:  # assume row-wise comparison
             other_set = frozenset(tuple(row) for row in other)
 
         if is_union:
@@ -2224,13 +3370,13 @@ def _ufunc_set_2d(
         # NOTE: this sort may not always be successful
         try:
             with WarningsSilent():
-                values: tp.Sequence[tp.Tuple[tp.Hashable, ...]] = sorted(result)
+                values: tp.Sequence[tp.Tuple[TLabel, ...]] = sorted(result)
         except TypeError:
             values = tuple(result)
 
         if is_2d:
             if len(values) == 0:
-                post = np.array(EMPTY_TUPLE, dtype=dtype).reshape(0, 0)
+                post = np.array((), dtype=dtype).reshape(0, cols)
             else:
                 post = np.array(values, dtype=object)
             post.flags.writeable = False
@@ -2258,7 +3404,7 @@ def _ufunc_set_2d(
 
     if width == 1:
         # let the function flatten the array, then reshape into 2D
-        post = func(array, other, **func_kwargs)  # type: ignore
+        post = func(array, other, **func_kwargs)
         post = post.reshape(len(post), width)
         post.flags.writeable = False
         return post
@@ -2270,142 +3416,130 @@ def _ufunc_set_2d(
     # creates a view of tuples for 1D operation
     array_view = array.view(dtype_view)
     other_view = other.view(dtype_view)
-    post = func(array_view, other_view, **func_kwargs).view(dtype).reshape(-1, width) # type: ignore
+    post = func(array_view, other_view, **func_kwargs).view(dtype).reshape(-1, width)
     post.flags.writeable = False
     return post
 
-def union1d(array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+
+def union1d(
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Union on 1D array, handling diverse types and short-circuiting to preserve order where appropriate.
-    '''
-    return _ufunc_set_1d(np.union1d,
-            array,
-            other,
-            assume_unique=assume_unique)
+    """
+    return _ufunc_set_1d(np.union1d, array, other, assume_unique=assume_unique)
+
 
 def intersect1d(
-        array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Intersect on 1D array, handling diverse types and short-circuiting to preserve order where appropriate.
-    '''
-    return _ufunc_set_1d(np.intersect1d,
-            array,
-            other,
-            assume_unique=assume_unique)
+    """
+    return _ufunc_set_1d(np.intersect1d, array, other, assume_unique=assume_unique)
+
 
 def setdiff1d(
-        array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Difference on 1D array, handling diverse types and short-circuiting to preserve order where appropriate
-    '''
-    return _ufunc_set_1d(np.setdiff1d,
-        array,
-        other,
-        assume_unique=assume_unique)
+    """
+    return _ufunc_set_1d(np.setdiff1d, array, other, assume_unique=assume_unique)
+
 
 def union2d(
-        array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Union on 2D array, handling diverse types and short-circuiting to preserve order where appropriate.
-    '''
-    return _ufunc_set_2d(np.union1d,
-            array,
-            other,
-            assume_unique=assume_unique)
+    """
+    return _ufunc_set_2d(np.union1d, array, other, assume_unique=assume_unique)
+
 
 def intersect2d(
-        array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Intersect on 2D array, handling diverse types and short-circuiting to preserve order where appropriate.
-    '''
-    return _ufunc_set_2d(np.intersect1d,
-            array,
-            other,
-            assume_unique=assume_unique)
+    """
+    return _ufunc_set_2d(np.intersect1d, array, other, assume_unique=assume_unique)
+
 
 def setdiff2d(
-        array: np.ndarray,
-        other: np.ndarray,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny, other: TNDArrayAny, assume_unique: bool = False
+) -> TNDArrayAny:
+    """
     Difference on 2D array, handling diverse types and short-circuiting to preserve order where appropriate.
-    '''
-    return _ufunc_set_2d(np.setdiff1d,
-        array,
-        other,
-        assume_unique=assume_unique)
+    """
+    return _ufunc_set_2d(np.setdiff1d, array, other, assume_unique=assume_unique)
+
+
+MANY_TO_ONE_MAP = {
+    (1, ManyToOneType.UNION): union1d,
+    (1, ManyToOneType.INTERSECT): intersect1d,
+    (1, ManyToOneType.DIFFERENCE): setdiff1d,
+    (2, ManyToOneType.UNION): union2d,
+    (2, ManyToOneType.INTERSECT): intersect2d,
+    (2, ManyToOneType.DIFFERENCE): setdiff2d,
+}
+
 
 def ufunc_set_iter(
-        arrays: tp.Iterable[np.ndarray],
-        union: bool = False,
-        assume_unique: bool = False
-        ) -> np.ndarray:
-    '''
+    arrays: tp.Iterable[TNDArrayAny],
+    many_to_one_type: ManyToOneType,
+    assume_unique: bool = False,
+) -> TNDArrayAny:
+    """
     Iteratively apply a set operation ufunc to 1D or 2D arrays; if all are equal, no operation is performed and order is retained.
 
     Args:
         arrays: iterator of arrays; can be a Generator.
         union: if True, a union is taken, else, an intersection.
-    '''
-    arrays = iter(arrays)
-    result = next(arrays)
-
+    """
     # will detect ndim by first value, but insure that all other arrays have the same ndim
-    if result.ndim == 1:
-        ufunc = union1d if union else intersect1d
-        ndim = 1
-    else: # ndim == 2
-        ufunc = union2d if union else intersect2d
-        ndim = 2
 
-    # skip processing for the same array instance
-    array_id = id(result)
-    for array in arrays:
-        if array.ndim != ndim:
+    if hasattr(arrays, '__len__') and len(arrays) == 2:  # type: ignore
+        a1, a2 = arrays
+        if a1.ndim != a2.ndim:
             raise RuntimeError('arrays do not all have the same ndim')
-        if array_id:
+        ufunc = MANY_TO_ONE_MAP[(a1.ndim, many_to_one_type)]  # pyright: ignore
+        result = ufunc(a1, a2, assume_unique=assume_unique)
+    else:
+        arrays = iter(arrays)
+        result = next(arrays)
+        ufunc = MANY_TO_ONE_MAP[(result.ndim, many_to_one_type)]  # pyright: ignore
+
+        # skip processing for the same array instance
+        array_id = id(result)
+        for array in arrays:
+            if array.ndim != result.ndim:
+                raise RuntimeError('arrays do not all have the same ndim')
             if id(array) == array_id:
                 continue
-            array_id = 0
-        # to retain order on identity, assume_unique must be True
-        result = ufunc(result, array, assume_unique=assume_unique)
+            # to retain order on identity, assume_unique must be True
+            result = ufunc(result, array, assume_unique=assume_unique)
 
-        if not union and len(result) == 0:
-            # short circuit intersection that results in no common values
-            break
+            if len(result) == 0 and (
+                many_to_one_type is ManyToOneType.INTERSECT
+                or many_to_one_type is ManyToOneType.DIFFERENCE
+            ):
+                # short circuit for ops with no common values
+                break
 
     result.flags.writeable = False
     return result
 
 
-def _isin_1d(
-        array: np.ndarray,
-        other: tp.FrozenSet[tp.Any]
-        ) -> np.ndarray:
-    '''
+def _isin_1d(array: TNDArrayAny, other: tp.FrozenSet[tp.Any]) -> TNDArrayAny:
+    """
     Iterate over an 1D array to build a 1D Boolean ndarray representing whether or not the original element is in the set
 
     Args:
         array: The source array
         other: The set of elements being looked for
-    '''
-    result: np.ndarray = np.empty(array.shape, dtype=DTYPE_BOOL)
+    """
+    result: TNDArrayAny = np.empty(array.shape, dtype=DTYPE_BOOL)
 
     for i, element in enumerate(array):
         result[i] = element in other
@@ -2414,18 +3548,15 @@ def _isin_1d(
     return result
 
 
-def _isin_2d(
-        array: np.ndarray,
-        other: tp.FrozenSet[tp.Any]
-        ) -> np.ndarray:
-    '''
+def _isin_2d(array: TNDArrayAny, other: tp.FrozenSet[tp.Any]) -> TNDArrayAny:
+    """
     Iterate over an 2D array to build a 2D, immutable, Boolean ndarray representing whether or not the original element is in the set
 
     Args:
         array: The source array
         other: The set of elements being looked for
-    '''
-    result: np.ndarray = np.empty(array.shape, dtype=DTYPE_BOOL)
+    """
+    result: TNDArrayAny = np.empty(array.shape, dtype=DTYPE_BOOL)
 
     for (i, j), v in np.ndenumerate(array):
         result[i, j] = v in other
@@ -2434,40 +3565,50 @@ def _isin_2d(
     return result
 
 
-def isin_array(*,
-        array: np.ndarray,
-        array_is_unique: bool,
-        other: np.ndarray,
-        other_is_unique: bool,
-        ) -> np.ndarray:
-    '''Core isin processing after other has been converted to an array.
-    '''
+def isin_array(
+    *,
+    array: TNDArrayAny,
+    array_is_unique: bool,
+    other: TNDArrayAny,
+    other_is_unique: bool,
+) -> TNDArrayAny:
+    """Core isin processing after other has been converted to an array."""
+    func: TUFunc
     if array.dtype == DTYPE_OBJECT or other.dtype == DTYPE_OBJECT:
         # both funcs return immutable arrays
         func = _isin_1d if array.ndim == 1 else _isin_2d
         try:
             return func(array, frozenset(other))
-        except TypeError: # only occur when something is unhashable.
+        except TypeError:  # only occur when something is unhashable.
             pass
 
     assume_unique = array_is_unique and other_is_unique
-    func = np.in1d if array.ndim == 1 else np.isin
+    # func = np.in1d if array.ndim == 1 else np.isin
+    func = np.isin
 
-    with WarningsSilent():
-        # FutureWarning: elementwise comparison failed;
-        result = func(array, other, assume_unique=assume_unique) #type: ignore
+    result: TNDArrayBool
+    if len(other) == 1:
+        # this alternative was implmented due to strange behavior in NumPy when using np.isin with "other" that is one element and an unsigned int
+        result = array == other
+
+        # NOTE: remove when min numpy is 1.25
+        if result.__class__ is not np.ndarray:
+            result = np.full(array.shape, result, dtype=DTYPE_BOOL)
+    else:
+        with WarningsSilent():
+            # FutureWarning: elementwise comparison failed;
+            result = func(array, other, assume_unique=assume_unique)
 
     result.flags.writeable = False
-
     return result
 
 
 def isin(
-        array: np.ndarray,
-        other: tp.Iterable[tp.Any],
-        array_is_unique: bool = False,
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny,
+    other: tp.Iterable[tp.Any],
+    array_is_unique: bool = False,
+) -> TNDArrayAny:
+    """
     Builds a same-size, immutable, Boolean ndarray representing whether or not the original element is in another ndarray
 
     numpy's has very poor isin performance, as it converts both arguments to array-like objects.
@@ -2477,148 +3618,38 @@ def isin(
         array: The source array
         other: The elements being looked for
         array_is_unique: if array is known to be unique
-    '''
-    result: tp.Optional[np.ndarray] = None
-
-    if hasattr(other, '__len__') and len(other) == 0: #type: ignore
-        result = np.full(array.shape, False, dtype=DTYPE_BOOL)
+    """
+    if hasattr(other, '__len__') and len(other) == 0:  # type: ignore
+        result: TNDArrayAny = np.full(array.shape, False, dtype=DTYPE_BOOL)
         result.flags.writeable = False
         return result
 
     other, other_is_unique = iterable_to_array_1d(other)
 
-    return isin_array(array=array,
-            array_is_unique=array_is_unique,
-            other=other,
-            other_is_unique=other_is_unique,
-            )
-
-#-------------------------------------------------------------------------------
-def _ufunc_logical_skipna(
-        array: np.ndarray,
-        ufunc: AnyCallable,
-        skipna: bool,
-        axis: int = 0,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    '''
-    Given a logical (and, or) ufunc that does not support skipna, implement skipna behavior.
-    '''
-    if ufunc != np.all and ufunc != np.any:
-        raise NotImplementedError(f'unsupported ufunc ({ufunc}); use np.all or np.any')
-
-    if len(array) == 0:
-        # any() of an empty array is False
-        return ufunc == np.all
-
-    kind = array.dtype.kind
-
-    #---------------------------------------------------------------------------
-    # types that cannot have NA
-    if kind == 'b':
-        return ufunc(array, axis=axis, out=out)
-    if kind in DTYPE_INT_KINDS:
-        return ufunc(array, axis=axis, out=out)
-    if kind in DTYPE_STR_KINDS:
-        # only string in object arrays can be converted to bool, where the empty string will be evaluated as False; here, manually check
-        return ufunc(array != '', axis=axis, out=out)
-
-    #---------------------------------------------------------------------------
-    # types that can have NA
-
-    if kind in DTYPE_INEXACT_KINDS:
-        isna = isna_array(array)
-        hasna = isna.any() # returns single value for 1d, 2d
-        if hasna and skipna:
-            fill_value = 0.0 if ufunc == np.any else 1.0
-            v = array.copy()
-            v[isna] = fill_value
-            return ufunc(v, axis=axis, out=out)
-        # NOTE: NaN will be interpreted as True
-        return ufunc(array, axis=axis, out=out)
-
-    if kind == 'O':
-        # all object types: convert to boolean aray then process
-        isna = isna_array(array)
-        hasna = isna.any() # returns single value for 1d, 2d
-        if hasna and skipna:
-            # supply True for np.all, False for np.any
-            fill_value = False if ufunc == np.any else True
-            v = array.astype(bool) # nan will be converted to True
-            v[isna] = fill_value
-        else:
-            # NOTE: NaN will be converted to True, None will be converted to False
-            v = array.astype(bool)
-        return ufunc(v, axis=axis, out=out)
-
-    # all other types assume truthy
-    # if kind in DTYPE_NAT_KINDS: # all dates are truthy, NAT is truthy
-
-    if array.ndim == 1:
-        return True
-    return np.full(array.shape[0 if axis else 1], fill_value=True, dtype=bool)
+    return isin_array(
+        array=array,
+        array_is_unique=array_is_unique,
+        other=other,
+        other_is_unique=other_is_unique,
+    )
 
 
-def ufunc_all(array: np.ndarray,
-        axis: int = 0,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    return _ufunc_logical_skipna(array,
-            ufunc=np.all,
-            skipna=False,
-            axis=axis,
-            out=out)
+# -------------------------------------------------------------------------------
 
-ufunc_all.__doc__ = np.all.__doc__
 
-def ufunc_any(array: np.ndarray,
-        axis: int = 0,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    return _ufunc_logical_skipna(array,
-            ufunc=np.any,
-            skipna=False,
-            axis=axis,
-            out=out)
-
-ufunc_any.__doc__ = np.any.__doc__
-
-def ufunc_nanall(array: np.ndarray,
-        axis: int = 0,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    return _ufunc_logical_skipna(array,
-            ufunc=np.all,
-            skipna=True,
-            axis=axis,
-            out=out)
-
-def ufunc_nanany(array: np.ndarray,
-        axis: int = 0,
-        out: tp.Optional[np.ndarray] = None
-        ) -> np.ndarray:
-    return _ufunc_logical_skipna(array,
-            ufunc=np.any,
-            skipna=True,
-            axis=axis,
-            out=out)
-
-#-------------------------------------------------------------------------------
-
-def array_from_element_attr(*,
-        array: np.ndarray,
-        attr_name: str,
-        dtype: np.dtype
-        ) -> np.array:
-    '''
+def array_from_element_attr(
+    *, array: TNDArrayAny, attr_name: str, dtype: TDtypeAny
+) -> TNDArrayAny:
+    """
     Handle element-wise attribute acesss on arrays of Python date/datetime objects.
-    '''
+    """
+    post: TNDArrayAny
     if array.ndim == 1:
         post = np.fromiter(
-                (getattr(d, attr_name) for d in array),
-                count=len(array),
-                dtype=dtype,
-                )
+            (getattr(d, attr_name) for d in array),
+            count=len(array),
+            dtype=dtype,
+        )
     else:
         post = np.empty(shape=array.shape, dtype=dtype)
         for iloc, e in np.ndenumerate(array):
@@ -2627,127 +3658,165 @@ def array_from_element_attr(*,
     post.flags.writeable = False
     return post
 
-def array_from_element_apply(*,
-        array: np.ndarray,
-        func: AnyCallable,
-        dtype: np.dtype
-        ) -> np.array:
-    '''
+
+def array_from_element_apply(
+    array: TNDArrayAny, func: TCallableAny, dtype: TDtypeAny
+) -> TNDArrayAny:
+    """
     Handle element-wise function application.
-    '''
+    """
+    post: TNDArrayAny
     if array.ndim == 1 and dtype != DTYPE_OBJECT and dtype.kind not in DTYPE_STR_KINDS:
         post = np.fromiter(
-                (func(d) for d in array),
-                count=len(array),
-                dtype=dtype,
-                )
+            (func(d) for d in array),
+            count=len(array),
+            dtype=dtype,
+        )
     elif dtype.kind not in DTYPE_STR_KINDS:
         post = np.empty(shape=array.shape, dtype=dtype)
         for iloc, e in np.ndenumerate(array):
             post[iloc] = func(e)
-    else: # a string kind that is unsized
-        post = np.array([func(e) for e in np.ravel(array)], dtype=dtype).reshape(array.shape)
+    else:  # a string kind that is unsized
+        post = np.array([func(e) for e in np.ravel(array)], dtype=dtype).reshape(
+            array.shape
+        )
 
     post.flags.writeable = False
     return post
 
 
-def array_from_element_method(*,
-        array: np.ndarray,
-        method_name: str,
-        args: tp.Tuple[tp.Any, ...],
-        dtype: np.dtype,
-        pre_insert: tp.Optional[AnyCallable] = None,
-        ) -> np.array:
-    '''
-    Handle element-wise method calling on arrays of Python objects.
+def array_from_element_method(
+    *,
+    array: TNDArrayAny,
+    method_name: str,
+    args: tp.Tuple[tp.Any, ...],
+    dtype: TDtypeAny,
+    pre_insert: tp.Optional[TCallableAny] = None,
+) -> TNDArrayAny:
+    """
+    Handle element-wise method calling on arrays of Python objects. For input arrays of strings or bytes, a string method can be extracted from the appropriate Python type. For other input arrays, the method will be extracted and called for each element.
 
     Args:
-        pre_insert:
-    '''
+        pre_insert: A function called on each element after the method is called.
+        dtype: dtype of array to be returned.
+    """
+    # when we know the type of the element, pre-fetch the Python class
+    cls_element: tp.Optional[tp.Type[tp.Any]]
+    if array.dtype.kind == 'U':
+        cls_element = str
+    elif array.dtype.kind == 'S':
+        cls_element = bytes
+    else:
+        cls_element = None
+
+    post: TNDArrayAny
+
     if dtype == DTYPE_STR:
-        # build into a list first, then construct array to determine size
-        if array.ndim == 1:
-            if pre_insert:
-                proto = [pre_insert(getattr(d, method_name)(*args)) for d in array]
+        # if destination is a string, must build into a list first, then construct array to determine dtype size
+        if cls_element is not None:  # if we can extract function from object first
+            func = getattr(cls_element, method_name)  # type: ignore
+            if array.ndim == 1:
+                if pre_insert:
+                    proto = [pre_insert(func(d, *args)) for d in array]
+                else:
+                    proto = [func(d, *args) for d in array]
             else:
-                proto = [getattr(d, method_name)(*args) for d in array]
-        else:
-            proto = [[None for _ in range(array.shape[1])]
-                    for _ in range(array.shape[0])]
-            if pre_insert:
-                for (y, x), e in np.ndenumerate(array):
-                    proto[y][x] = pre_insert(getattr(e, method_name)(*args))
+                proto = [
+                    [None for _ in range(array.shape[1])] for _ in range(array.shape[0])
+                ]
+                if pre_insert:
+                    for (y, x), e in np.ndenumerate(array):
+                        proto[y][x] = pre_insert(func(e, *args))
+                else:
+                    for (y, x), e in np.ndenumerate(array):
+                        proto[y][x] = func(e, *args)
+        else:  # must call getattr for each element
+            if array.ndim == 1:
+                if pre_insert:
+                    proto = [pre_insert(getattr(d, method_name)(*args)) for d in array]
+                else:
+                    proto = [getattr(d, method_name)(*args) for d in array]
             else:
-                for (y, x), e in np.ndenumerate(array):
-                    proto[y][x] = getattr(e, method_name)(*args)
+                proto = [
+                    [None for _ in range(array.shape[1])] for _ in range(array.shape[0])
+                ]
+                if pre_insert:
+                    for (y, x), e in np.ndenumerate(array):
+                        proto[y][x] = pre_insert(getattr(e, method_name)(*args))
+                else:
+                    for (y, x), e in np.ndenumerate(array):
+                        proto[y][x] = getattr(e, method_name)(*args)
         post = np.array(proto, dtype=dtype)
 
-    else:
-        if array.ndim == 1 and dtype != DTYPE_OBJECT:
-            # NOTE: can I get the method off the clas and pass self
-            if pre_insert:
-                post = np.fromiter(
+    else:  # returned dtype is not a string
+        if cls_element is not None:  # if we can extract function from object first
+            func = getattr(cls_element, method_name)  # type: ignore
+            if array.ndim == 1 and dtype != DTYPE_OBJECT:
+                if pre_insert:
+                    post = np.fromiter(
+                        (pre_insert(func(d, *args)) for d in array),
+                        count=len(array),
+                        dtype=dtype,
+                    )
+                else:
+                    post = np.fromiter(
+                        (func(d, *args) for d in array),
+                        count=len(array),
+                        dtype=dtype,
+                    )
+            else:  # PERF: slower to always use ndenumerate
+                post = np.empty(shape=array.shape, dtype=dtype)
+                if pre_insert:
+                    for iloc, e in np.ndenumerate(array):
+                        post[iloc] = pre_insert(func(e, *args))
+                else:
+                    for iloc, e in np.ndenumerate(array):
+                        post[iloc] = func(e, *args)
+
+        else:
+            if array.ndim == 1 and dtype != DTYPE_OBJECT:
+                if pre_insert:
+                    post = np.fromiter(
                         (pre_insert(getattr(d, method_name)(*args)) for d in array),
                         count=len(array),
                         dtype=dtype,
-                        )
-            else:
-                post = np.fromiter(
+                    )
+                else:
+                    post = np.fromiter(
                         (getattr(d, method_name)(*args) for d in array),
                         count=len(array),
                         dtype=dtype,
-                        )
-        else:
-            post = np.empty(shape=array.shape, dtype=dtype)
-            if pre_insert:
-                for iloc, e in np.ndenumerate(array):
-                    post[iloc] = pre_insert(getattr(e, method_name)(*args))
+                    )
             else:
-                for iloc, e in np.ndenumerate(array):
-                    post[iloc] = getattr(e, method_name)(*args)
+                post = np.empty(shape=array.shape, dtype=dtype)
+                if pre_insert:
+                    for iloc, e in np.ndenumerate(array):
+                        post[iloc] = pre_insert(getattr(e, method_name)(*args))
+                else:
+                    for iloc, e in np.ndenumerate(array):
+                        post[iloc] = getattr(e, method_name)(*args)
 
     post.flags.writeable = False
     return post
 
 
-# def array_from_iterator(iterator: tp.Iterator[tp.Any],
-#         count: int,
-#         dtype: DtypeSpecifier,
-#         ) -> np.ndarray:
-#     '''Given an iterator/generator of known size and dtype, load it into an array.
-#     '''
-#     dtype = np.dtype(dtype)
-#     if dtype.kind in DTYPE_STR_KINDS:
-#         # unless we know the size of the max size of the string, we have to go through the default construictor.
-#         array, _ = iterable_to_array_1d(iterator, dtype)
-#         return array
-#     elif dtype.kind != DTYPE_OBJECT_KIND:
-#         array = np.fromiter(iterator,
-#                 count=count,
-#                 dtype=dtype,
-#                 )
-#     else: # object types
-#         array = np.empty(count, dtype=dtype)
-#         for i, v in enumerate(iterator):
-#             array[i] = v
+# -------------------------------------------------------------------------------
 
-#     array.flags.writeable = False
-#     return array
-
-
-#-------------------------------------------------------------------------------
 
 class PositionsAllocator:
-    '''Resource for re-using a single array of contiguous ascending integers for common applications in IndexBase.
-    '''
+    """Resource for re-using a single array of contiguous ascending integers for common applications in IndexBase."""
 
-    _size: int = 1024 # 1048576
-    _array: np.ndarray = np.arange(_size, dtype=DTYPE_INT_DEFAULT)
+    _size: int = 1024  # 1048576
+    _array: TNDArrayIntDefault = np.arange(_size, dtype=DTYPE_INT_DEFAULT)
     _array.flags.writeable = False
 
+    # NOTE: preliminary tests of using lru-style caching on these instances has not shown a general benfit
+
     @classmethod
-    def get(cls, size: int) -> np.ndarray:
+    def get(cls, size: int) -> TNDArrayIntDefault:
+        if size == 1:
+            return UNIT_ARRAY_INT
+
         if size > cls._size:
             cls._size = size * 2
             cls._array = np.arange(cls._size, dtype=DTYPE_INT_DEFAULT)
@@ -2757,14 +3826,14 @@ class PositionsAllocator:
 
 
 def array_sample(
-        array: np.ndarray,
-        count: int,
-        seed: tp.Optional[int] = None,
-        sort: bool = False,
-        ) -> np.ndarray:
-    '''
+    array: TNDArrayAny,
+    count: int,
+    seed: tp.Optional[int] = None,
+    sort: bool = False,
+) -> TNDArrayAny:
+    """
     Given an array 1D or 2D array, randomly sample ``count`` components of that array. Sampling is always done "without replacment", meaning that the resulting array will never have duplicates. For 2D array, selection happens along axis 0.
-    '''
+    """
     if array.ndim != 1:
         raise NotImplementedError(f'no handling for axis {array.ndim}')
 
@@ -2782,27 +3851,191 @@ def array_sample(
     post.flags.writeable = False
     return post
 
-#-------------------------------------------------------------------------------
-def list_to_tuple(value: tp.Any) -> tp.Any:
-    '''Recursively convert any observed lists into tuples; this is used as a post processor for objects coming back from JSON decoding.
-    '''
-    # Using `is` here deemed appropriate as objects coming back from json decoder.
-    if value.__class__ is not list:
-        return value
-    return tuple(list_to_tuple(v) for v in value)
+
+def run_length_1d(array: TNDArrayAny) -> tp.Tuple[TNDArrayAny, TNDArrayAny]:
+    """Given an array of values, discover contiguous values and their length.
+
+    Return:
+        np.ndarray: a value per contiguous width
+        np.ndarray: a width per contiguous value
+    """
+    assert array.ndim == 1
+
+    size = len(array)
+    if size == 0:
+        return EMPTY_ARRAY, EMPTY_ARRAY_INT
+    if size == 1:
+        return array[:1], np.array((size,), dtype=DTYPE_INT_DEFAULT)
+
+    # this provides one True for the start of each region, including the first
+    transitions = np.empty(size, dtype=DTYPE_BOOL)
+    transitions[0] = True
+    transitions[1:] = (array != np.roll(array, 1))[1:]
+
+    # get the index at the the transition for each width
+    idx = PositionsAllocator.get(size)[transitions]
+
+    # use the difference in positions to get widths; we need the width from the last transition to the full length in the last position
+    widths = np.empty(len(idx), dtype=DTYPE_INT_DEFAULT)
+    widths[-1] = size - idx[-1]
+    widths[:-1] = (idx - np.roll(idx, 1))[1:]
+
+    return array[transitions], widths
 
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+# json utils
+
+
+class JSONFilter:
+    """Note: this is filter for encoding NumPy arrays and Python objects in generally readible format by naive consumers. Thus all dates are represented as date strings. This differs from using `__repr__` and attempting to reanimate Python types."""
+
+    @staticmethod
+    def encode_element(obj: tp.Any) -> tp.Any:
+        """Convert non-JSON compatible objects to JSON compatible objects or strings. This will recursively process components of iterables."""
+        if obj is None:
+            return obj
+        if isinstance(obj, (str, bytes, int, float)):
+            return obj
+        if isinstance(obj, datetime.date):
+            return obj.isoformat()
+        if isinstance(obj, (Fraction, complex, np.timedelta64, np.datetime64)):
+            return str(obj)
+        if hasattr(obj, 'dtype'):
+            if obj.dtype.kind in ('c', 'M', 'm'):
+                if obj.ndim == 0:
+                    return str(obj)
+                if obj.ndim == 1:
+                    return [str(e) for e in obj]
+                return [[str(e) for e in row] for row in obj]
+            if obj.ndim == 0:
+                return obj.item()
+            return obj.tolist()
+
+        if isinstance(obj, dict):
+            ee = JSONFilter.encode_element
+            return {ee(k): ee(v) for k, v in obj.items()}
+        if hasattr(obj, '__iter__'):
+            ee = JSONFilter.encode_element
+            return [ee(e) for e in obj]
+        # let pass and raise on JSON encoding
+        return obj
+
+    @classmethod
+    def encode_items(
+        cls,
+        items: tp.Iterator[tp.Tuple[TLabel, tp.Any]],
+    ) -> tp.Any:
+        """Return a key-value mapping. Saves on isinstance checks when we no what the outer container is."""
+        ee = cls.encode_element
+        return {ee(k): ee(v) for k, v in items}
+
+    @classmethod
+    def encode_iterable(
+        cls,
+        iterable: tp.Iterable[tp.Any],
+    ) -> tp.Any:
+        """Return an iterable. Saves on isinstance checks when we no what the outer container is."""
+        ee = cls.encode_element
+        return [ee(v) for v in iterable]
+
+
+class Reanimate:
+    RE: tp.Pattern[str]
+
+    @classmethod
+    def filter(cls, value: str) -> tp.Any:
+        raise NotImplementedError()  # pragma: no cover
+
+
+class ReanimateDT64(Reanimate):
+    # NOTE: in NumPy 2, the string repr is changed to use "np" instead of "numpy"
+    RE = re.compile(r"(?:numpy|np)\.datetime64\('([-.T:0-9]+)'\)")
+
+    @classmethod
+    def filter(cls, value: str) -> tp.Any:
+        post = cls.RE.fullmatch(value)
+        if post is None:
+            return value
+        return np.datetime64(post.group(1))
+
+
+class ReanimateDTD(Reanimate):
+    RE = re.compile(r'datetime.date\(([ ,0-9]+)\)')
+
+    @classmethod
+    def filter(cls, value: str) -> tp.Any:
+        post = cls.RE.fullmatch(value)
+        if post is None:
+            return value
+        args = ast.literal_eval(post.group(1))
+        return datetime.date(*args)
+
+
+class JSONTranslator(JSONFilter):
+    """JSON encoding of select types to permit reanimation. Let fail types that are not encodable and are not explicitly handled."""
+
+    REANIMATEABLE = (ReanimateDT64, ReanimateDTD)
+
+    @staticmethod
+    def encode_element(obj: tp.Any) -> tp.Any:
+        """From a Python object, pre-JSON encoding, replacing any Python objects with discoverable strings."""
+        if obj is None:
+            return obj
+
+        if isinstance(obj, STRING_TYPES):
+            return obj
+
+        if isinstance(obj, (np.datetime64, datetime.date)):
+            return repr(obj)  # take repr for encoding / decoding
+
+        if isinstance(obj, dict):
+            ee = JSONTranslator.encode_element
+            return {ee(k): ee(v) for k, v in obj.items()}
+        if hasattr(obj, '__iter__'):
+            ee = JSONTranslator.encode_element
+            # all iterables must be lists for JSON encoding
+            return [ee(e) for e in obj]
+
+        return obj
+
+    @classmethod
+    def decode_element(cls, obj: tp.Any) -> tp.Any:
+        """Given an object post JSON conversion, check all strings for strings that can be converted to python objects. Also, all lists are converted to tuples"""
+        if obj is None:
+            return obj
+
+        if isinstance(obj, str):
+            # test regular expressions
+            for reanimate in cls.REANIMATEABLE:
+                post = reanimate.filter(obj)
+                if post is not obj:
+                    return post
+            return obj
+
+        if obj.__class__ is list:  # post JSON, only ever be lists
+            de = cls.decode_element
+            # realize all things JSON gives as lists to tuples
+            return tuple(de(e) for e in obj)
+        if isinstance(obj, dict):
+            de = cls.decode_element
+            return {de(k): de(v) for k, v in obj.items()}
+
+        return obj
+
+
+# -------------------------------------------------------------------------------
+
 
 def slices_from_targets(
-        target_index: tp.Sequence[int],
-        target_values: tp.Sequence[tp.Any],
-        length: int,
-        directional_forward: bool,
-        limit: int,
-        slice_condition: tp.Callable[[slice], bool]
-        ) -> tp.Iterator[tp.Tuple[slice, tp.Any]]:
-    '''
+    target_index: tp.Sequence[int] | TNDArrayAny,
+    target_values: tp.Iterable[tp.Any],
+    length: int,
+    directional_forward: bool,
+    limit: int,
+    slice_condition: tp.Callable[[slice], bool],
+) -> tp.Iterator[tp.Tuple[slice, tp.Any]]:
+    """
     Utility function used in fillna_directional implementations for Series and Frame. Yields slices and values for setting contiguous ranges of values.
 
     NOTE: slice_condition is still needed to check if a slice actually has missing values; see if there is a way to determine these cases in advance, so as to not call a function on each slice.
@@ -2814,27 +4047,27 @@ def slices_from_targets(
         directional_forward: determine direction
         limit: set a max size for all slices
         slice_condition: optional function for filtering slices.
-    '''
+    """
     if directional_forward:
         target_slices = (
-                slice(start+1, stop)
-                for start, stop in
-                zip_longest(target_index, target_index[1:], fillvalue=length)
-                )
+            slice(start + 1, stop)
+            for start, stop in zip_longest(
+                target_index, target_index[1:], fillvalue=length
+            )
+        )
     else:
         # use None to signal first value, but store 0
         target_slices = (
-                slice((start+1 if start is not None else 0), stop)
-                for start, stop in
-                zip(chain(ELEMENT_TUPLE, target_index[:-1]), target_index)
-                )
+            slice((start + 1 if start is not None else 0), stop)
+            for start, stop in zip(chain(ELEMENT_TUPLE, target_index[:-1]), target_index)
+        )
 
     for target_slice, value in zip(target_slices, target_values):
         # asserts not necessary as slices are created above; but mypy needs them
         assert target_slice.start is not None and target_slice.stop is not None
 
         # all conditions that are noop slices
-        if target_slice.start == target_slice.stop: #pylint: disable=R1724
+        if target_slice.start == target_slice.stop:
             # matches case where start is 0 and stop is 0
             continue
         elif directional_forward and target_slice.start >= length:
@@ -2842,85 +4075,75 @@ def slices_from_targets(
 
         # only process if first value of slice is NaN
         if slice_condition(target_slice):
-
             if limit > 0:
                 # get the length of the range resulting from the slice; if bigger than limit, reduce the by that amount
                 shift = len(range(*target_slice.indices(length))) - limit
                 if shift > 0:
-
                     if directional_forward:
                         target_slice = slice(
-                                target_slice.start,
-                                target_slice.stop - shift)
+                            target_slice.start, target_slice.stop - shift
+                        )
                     else:
                         target_slice = slice(
-                                (target_slice.start or 0) + shift,
-                                target_slice.stop)
+                            (target_slice.start or 0) + shift, target_slice.stop
+                        )
 
             yield target_slice, value
 
 
-
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # URL handling, file downloading, file writing
 
-def path_filter(fp: PathSpecifierOrFileLikeOrIterator) -> tp.Union[str, tp.TextIO]:
-    '''Realize Path objects as strings, let TextIO pass through, if given.
-    '''
+
+def path_filter(fp: TPathSpecifierOrTextIOOrIterator | None) -> str | tp.TextIO:
+    """Realize Path objects as strings, let TextIO pass through, if given."""
     if fp is None:
         raise ValueError('None cannot be interpreted as a file path')
+
     if isinstance(fp, PathLike):
-        return str(fp)
-    return fp #type: ignore [return-value]
+        return os.fspath(fp)  # type: ignore [no-any-return]
 
-
-def _read_url(fp: str) -> str:
-    '''
-    Read a URL into memory, return a decoded string.
-    '''
-    with request.urlopen(fp) as response: #pragma: no cover
-        return tp.cast(str, response.read().decode('utf-8')) #pragma: no cover
+    return fp  # type: ignore [return-value]
 
 
 def write_optional_file(
-        content: str,
-        fp: tp.Optional[PathSpecifierOrFileLike] = None,
-        ) -> tp.Optional[str]:
-
+    content: str,
+    fp: tp.Optional[TPathSpecifierOrTextIO] = None,
+) -> tp.Optional[str]:
     if fp is not None:
         fp = path_filter(fp)
 
     fd = f = None
-    if not fp: # get a temp file
+    if not fp:  # get a temp file
         fd, fp = tempfile.mkstemp(suffix='.html', text=True)
     elif isinstance(fp, StringIO):
         f = fp
         fp = None
     # nothing to do if we have an fp
 
-    if f is None: # do not have a file object
+    if f is None:  # do not have a file object
         try:
             assert isinstance(fp, str)
-            with tp.cast(StringIO, open(fp, 'w')) as f:
+            with tp.cast(StringIO, open(fp, 'w', encoding='utf-8')) as f:
                 f.write(content)
         finally:
             if fd is not None:
                 os.close(fd)
-    else: # string IO
+    else:  # string IO
         f.write(content)
         f.seek(0)
-    return fp #type: ignore
+    return fp  # type: ignore
 
 
 @contextlib.contextmanager
 def file_like_manager(
-        file_like: PathSpecifierOrFileLikeOrIterator,
-        encoding: tp.Optional[str] = None,
-        mode: str = 'r',
-        ) -> tp.Iterator[tp.Iterator[str]]:
-    '''
+    file_like: TPathSpecifierOrTextIOOrIterator,
+    encoding: tp.Optional[str] = None,
+    mode: str = 'r',
+) -> tp.Iterator[tp.Iterator[str]]:
+    """
     Return an file or file-like object. Manage closing of file if necessary.
-    '''
+    """
     file_like = path_filter(file_like)
 
     is_file = False
@@ -2929,46 +4152,90 @@ def file_like_manager(
             f = open(file_like, mode=mode, encoding=encoding)
             is_file = True
         else:
-            f = file_like # assume an open file-like object
+            f = file_like  # assume an open file-like object
         yield f
 
     finally:
         if is_file:
             f.close()
 
-#-------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------
 # trivial, non NP util
 
+
 def get_tuple_constructor(
-        fields: np.ndarray,
-        ) -> TupleConstructorType:
-    '''
+    fields: TNDArrayAny,
+) -> TTupleCtor:
+    """
     Given fields, try to create a Namedtuple and return the `_make` method
-    '''
+    """
     # this will raise if attrs are invalid
     try:
-        return namedtuple('Axis', fields)._make #type: ignore
+        return namedtuple('Axis', fields)._make  # type: ignore
     except ValueError:
         pass
     raise ValueError('invalid fields for namedtuple; pass `tuple` as constructor')
 
 
-def key_normalize(key: KeyOrKeys) -> tp.List[tp.Hashable]:
-    '''
+def key_normalize(key: TKeyOrKeys) -> tp.List[TLabel]:
+    """
     Normalizing a key that might be a single element or an iterable of keys; expected return is always a list, as it will be used for getitem selection.
-    '''
-    if isinstance(key, str) or not hasattr(key, '__len__'):
-        return [key]
-    return key if isinstance(key, list) else list(key) # type: ignore
+    """
+    if isinstance(key, STRING_TYPES) or not hasattr(key, '__len__'):
+        return [key]  # type: ignore
+    return key if isinstance(key, list) else list(key)  # type: ignore
 
 
-def iloc_to_insertion_iloc(key: int, size: int) -> int:
-    '''
+def iloc_to_insertion_iloc(
+    key: int | np.integer[tp.Any],
+    size: int,
+) -> int | np.integer[tp.Any]:
+    """
     Given an iloc (possibly bipolar), return the appropriate insertion iloc (always positive)
-    '''
+    """
     if key < -size or key >= size:
         raise IndexError(f'index {key} out of range for length {size} container.')
     return key % size
 
 
+def order_is_sorted_asc(arr: TNDArrayIntDefault) -> bool:
+    positions = PositionsAllocator.get(len(arr))
 
+    # If we scan the whole array without finding a mismatch, it means it is ordered
+    return first_true_1d(arr != positions, forward=True) == -1
+
+
+# def _slices_from_transitions(
+#     transitions: tp.Iterator[int], size: int
+# ) -> tp.Iterator[slice]:
+#     start = 0
+#     for t in transitions:
+#         yield slice(start, t)
+#         start = t
+
+#     if start < size:
+#         yield slice(start, None)
+
+
+# def transition_slices_from_group(group: TNDArrayAny) -> tuple[tp.Iterator[slice], bool]:
+#     if group.ndim == 2:
+#         group_to_tuple = True
+#         if group.dtype == DTYPE_OBJECT:
+#             # NOTE: cannot get view of object; use string
+#             consolidated = view_2d_as_1d(group.astype(str))
+#         else:
+#             consolidated = view_2d_as_1d(group)
+#         transitions = nonzero_1d(consolidated != roll_1d(consolidated, 1))[1:]
+#     else:
+#         group_to_tuple = False
+#         transitions = nonzero_1d(group != roll_1d(group, 1))[1:]
+
+#     return _slices_from_transitions(transitions, len(group)), group_to_tuple  # type: ignore
+
+
+def callable_name(func: TCallableAny) -> str:
+    if isinstance(func, partial):
+        return func.func.__name__
+
+    return func.__name__

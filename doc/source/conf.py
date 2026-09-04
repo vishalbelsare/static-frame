@@ -12,126 +12,84 @@
 # All configuration values have a default; values that are commented out
 # serve to show the default.
 
-import sys
-import os
 import datetime
-import io
-import inspect
-import typing as tp
+import os
+
+import typing_extensions as tp
 
 import static_frame as sf
-
+from static_frame.core.interface import DOCUMENTED_COMPONENTS
+from static_frame.core.interface import INTERFACE_GROUP_DOC
 from static_frame.core.interface import INTERFACE_GROUP_ORDER
 from static_frame.core.interface import InterfaceSummary
-from static_frame.core.util import AnyCallable
-from static_frame.performance import core
-from static_frame.performance.perf_test import PerfTest
-from static_frame.test.unit.test_doc import api_example_str
 
 PREFIX_START = '#start_'
 PREFIX_END = '#end_'
 
 def get_defined() -> tp.Set[str]:
 
+    source_dir = os.path.abspath(os.path.dirname(__file__))
+    fp = os.path.join(source_dir, 'examples.txt')
+
     defined = set()
     signature_start = ''
     signature_end = ''
 
-    for line in api_example_str.split('\n'):
-        if line.startswith(PREFIX_START):
-            signature_start = line.replace(PREFIX_START, '').strip()
-        elif line.startswith(PREFIX_END):
-            signature_end = line.replace(PREFIX_END, '').strip()
-            if signature_start == signature_end:
-                if signature_start in defined:
-                    raise RuntimeError(f'duplicate definition: {signature_start}')
-                defined.add(signature_start)
-                signature_start = ''
-                signature_end = ''
-            else:
-                raise RuntimeError(f'mismatched: {signature_start}: {signature_end}')
-
+    with open(fp) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith(PREFIX_START):
+                signature_start = line.replace(PREFIX_START, '').strip()
+            elif line.startswith(PREFIX_END):
+                signature_end = line.replace(PREFIX_END, '').strip()
+                if signature_start == signature_end:
+                    if signature_start in defined:
+                        raise RuntimeError(f'duplicate definition: {signature_start}')
+                    defined.add(signature_start)
+                    signature_start = ''
+                    signature_end = ''
+                else:
+                    raise RuntimeError(f'mismatched: {signature_start}: {signature_end}')
     return defined
-
-# If extensions (or modules to document with autodoc) are in another directory,
-# add these directories to sys.path here. If the directory is relative to the
-# documentation root, use os.path.abspath to make it absolute, like shown here.
-
-DOCUMENTED_COMPONENTS = (
-        sf.Series,
-        sf.SeriesHE,
-        sf.Frame,
-        sf.FrameGO,
-        sf.FrameHE,
-        sf.Bus,
-        sf.Batch,
-        sf.Yarn,
-        sf.Quilt,
-        sf.Index,
-        sf.IndexGO,
-        sf.IndexHierarchy,
-        sf.IndexHierarchyGO,
-        sf.IndexYear,
-        sf.IndexYearGO,
-        sf.IndexYearMonth,
-        sf.IndexYearMonthGO,
-        sf.IndexDate,
-        sf.IndexDateGO,
-        sf.IndexMinute,
-        sf.IndexMinuteGO,
-        sf.IndexHour,
-        sf.IndexHourGO,
-        sf.IndexSecond,
-        sf.IndexSecondGO,
-        sf.IndexMillisecond,
-        sf.IndexMillisecondGO,
-        sf.IndexMicrosecond,
-        sf.IndexMicrosecondGO,
-        sf.IndexNanosecond,
-        sf.IndexNanosecondGO,
-        sf.DisplayConfig,
-        sf.StoreConfig,
-        sf.StoreFilter,
-        sf.NPZ,
-        sf.NPY,
-        )
 
 
 def get_jinja_contexts() -> tp.Dict[str, tp.Any]:
+    print('calling get_jinja_contexts')
+    # NOTE: we build dictionaries here so that we can pre-select groups when setting up args into the jina tempalates in source_build.py
 
     post: tp.Dict[str, tp.Any] = {}
 
-    performance_cls = []
-    for name in dir(core):
-        obj = getattr(core, name)
-        if inspect.isclass(obj) and issubclass(obj, PerfTest):
-            performance_cls.append(obj.__name__)
-
-    post['performance_cls'] = performance_cls
-
     # for docs
     post['examples_defined'] = get_defined()
-    # post['interface_groups'] = INTERFACE_GROUP_ORDER
-
+    post['interface_group_doc'] = INTERFACE_GROUP_DOC
+    post['toc'] = {}
     post['interface'] = {}
-    for target in DOCUMENTED_COMPONENTS:
-        inter = InterfaceSummary.to_frame(target, #type: ignore
+    for cls in DOCUMENTED_COMPONENTS:
+        inter = InterfaceSummary.to_frame(cls,
                 minimized=False,
                 max_args=99, # +inf, but keep as int
                 )
-        # break into iterable of group, frame
-        inter_items = []
-        for g in INTERFACE_GROUP_ORDER:
-            inter_sub = inter.loc[inter['group'] == g]
-            if len(inter_sub): # some groups are empty
-                inter_items.append((g, inter_sub))
-        post['interface'][target.__name__] = (
-                target.__name__,
-                target,
-                inter_items,
-                )
+        post['interface'][cls.__name__] = {}
+
+        groups = []
+        for ig in INTERFACE_GROUP_ORDER:
+            ig_tag = ig.replace('-', '_').replace(' ', '_').lower()
+            inter_sub = inter.loc[inter['group'] == ig]
+            if len(inter_sub) == 0: # skip empty groups
+                continue
+            post['interface'][cls.__name__][ig_tag] = (
+                    cls.__name__,
+                    ig,
+                    ig_tag,
+                    inter_sub,
+                    )
+            groups.append((ig, ig_tag))
+
+        post['toc'][cls.__name__] = tuple(groups)
+
     return post
 
+# NOTE: this incurs processing on module load
 jinja_contexts = {'ctx': get_jinja_contexts()}
 
 
@@ -145,10 +103,8 @@ jinja_contexts = {'ctx': get_jinja_contexts()}
 extensions = [
         'sphinx.ext.autodoc',
         'sphinx.ext.viewcode',
-        'sphinx.ext.graphviz',
-        'sphinx.ext.inheritance_diagram',
-        'sphinxcontrib.napoleon',
-        'sphinxcontrib.jinja',
+        'sphinx.ext.napoleon',
+        'sphinx_jinja',
         ]
 
 
@@ -220,18 +176,26 @@ pygments_style = 'sphinx'
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-on_rtd = os.environ.get('READTHEDOCS') == 'True'
-if on_rtd:
-    html_theme = 'default'
-else:
-    import sphinx_rtd_theme
-    html_theme = "sphinx_rtd_theme"
-    html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+# on_rtd = os.environ.get('READTHEDOCS') == 'True'
+# if on_rtd:
+#     html_theme = 'default'
+# else:
+#     import sphinx_rtd_theme
+#     html_theme = 'sphinx_rtd_theme'
+#     html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+
+html_theme = 'pydata_sphinx_theme'
+
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
-#html_theme_options = {}
+
+html_theme_options = {
+   "navbar_align": "left",
+  "secondary_sidebar_items": ["page-toc"],
+   "show_toc_level": 2,
+}
 
 # Add any paths that contain custom themes here, relative to this directory.
 #html_theme_path = []
@@ -245,12 +209,12 @@ else:
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-#html_logo = None
+html_logo = '../images/sf-logo-web_icon-small.png'
 
 # The name of an image file (within the static path) to use as favicon of the
 # docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
 # pixels large.
-html_favicon = "../images/favicon.ico"
+html_favicon = '../images/favicon.ico'
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -266,8 +230,9 @@ html_last_updated_fmt = '%b %d, %Y'
 #html_use_smartypants = True
 
 # Custom sidebar templates, maps document names to template names.
-#html_sidebars = {}
-
+html_sidebars = {
+  "**": []
+}
 # Additional templates that should be rendered to pages, maps page names to
 # template names.
 #html_additional_pages = {}
@@ -368,3 +333,6 @@ texinfo_documents: tp.List[tp.Tuple[str, str, str, str, str, str, str]] = []
 
 # If true, do not generate a @detailmenu in the "Top" node's menu.
 #texinfo_no_detailmenu = False
+
+
+autodoc_typehints = 'none'

@@ -1,16 +1,16 @@
 
 
 import os
-import timeit
-import tempfile
-import typing as tp
 import pickle
+import tempfile
+import timeit
 
-import numpy as np
 import frame_fixtures as ff
+import numpy as np
+import typing_extensions as tp
+
 import static_frame as sf
 from static_frame.core.display_color import HexColor
-
 
 FF_wide = 's(10,1_000)|v(int,int,bool,float,float)|i(I,str)|c(I,int)'
 FF_tall = 's(1_000,10)|v(int,int,bool,float,float)|i(I,str)|c(I,int)'
@@ -43,7 +43,7 @@ class FileReadBusParquet(FileIOTest):
         super().__init__(fixtures)
         b = sf.Bus.from_frames(self.fixtures)
         b.to_zip_parquet(self.fp)
-        self.config = sf.StoreConfig(index_depth=1, columns_depth=1)
+        self.config = sf.StoreConfigParquet(index_depth=1, columns_depth=1)
 
     def __call__(self):
         b = sf.Bus.from_zip_parquet(self.fp, config=self.config)
@@ -143,7 +143,6 @@ def run_test():
             include_index=False,
             )
     print(display.display(config))
-    # import ipdb; ipdb.set_trace()
 
 if __name__ == '__main__':
     run_test()

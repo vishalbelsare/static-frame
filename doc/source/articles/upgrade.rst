@@ -50,9 +50,9 @@ Even though Pandas has specialized constructors, the default ``pd.DataFrame`` co
 1   tau  1.777
 
 
-For the user, there is little benefit to this diversity and redundancy. StaticFrame places all constructors on the class they construct, and as much as possible, narrowly focuses their functionality. As they are easier to maintain, explicit, specialized constructors are common in StaticFrame. For example, ``sf.Frame.from_json()`` and ``sf.Frame.from_dict_records()``:
+For the user, there is little benefit to this diversity and redundancy. StaticFrame places all constructors on the class they construct, and as much as possible, narrowly focuses their functionality. As they are easier to maintain, explicit, specialized constructors are common in StaticFrame. For example, ``sf.Frame.from_json_records()`` and ``sf.Frame.from_dict_records()``:
 
->>> sf.Frame.from_json('[{"name":"muon", "mass":0.106}, {"name":"tau", "mass":1.777}]')
+>>> sf.Frame.from_json_records('[{"name":"muon", "mass":0.106}, {"name":"tau", "mass":1.777}]')
 <Frame>
 <Index> name  mass      <<U4>
 <Index>
@@ -90,8 +90,6 @@ from_elements(elements, *, index,... Frame    Constructor Create a Frame fr...
 from_fields(fields, *, index, col... Frame    Constructor Frame constructor...
 from_hdf5(fp, *, label, index_dep... Frame    Constructor Load Frame from t...
 from_items(pairs, *, index, fill_... Frame    Constructor Frame constructor...
-from_json(json_data, *, dtypes, n... Frame    Constructor Frame constructor...
-from_json_url(url, *, dtypes, nam... Frame    Constructor Frame constructor...
 from_msgpack(msgpack_data)           Frame    Constructor Frame constructor...
 from_overlay(containers, *, index... Frame    Constructor Return a new Fram...
 from_pandas(value, *, index_const... Frame    Constructor Given a Pandas Da...
@@ -158,7 +156,7 @@ As much time is spent visually exploring the contents of these containers, Stati
 While ``pd.set_option()`` can similarly be used to set Pandas display characteristics, StaticFrame provides more extensive options for making types discoverable. As shown in the following terminal animation, specific types can be colored or type annotations can be removed entirely.
 
 
-.. image:: https://raw.githubusercontent.com/InvestmentSystems/static-frame/master/doc/images/animate-display-config.svg
+.. image:: https://raw.githubusercontent.com/static-frame/static-frame/master/doc/images/animate-display-config.svg
    :align: center
 
 
@@ -616,5 +614,5 @@ ____________________________________________________
 
 The concept of a "data frame" object came long before Pandas 0.1 release in 2009: the first implementation of a data frame may have been as early as 1991 in the S language, a predecessor of R. Today, the data frame finds realization in a wide variety of languages and implementations. Pandas will continue to provide an excellent resource to a broad community of users. However, for situations where correctness and code maintainability are critical, StaticFrame offers an alternative designed to be more consistent and reduce opportunities for error.
 
-For more information about StaticFrame, see the documentation (http://static-frame.readthedocs.io) or project site (https://github.com/InvestmentSystems/static-frame).
+For more information about StaticFrame, see the documentation (http://static-frame.readthedocs.io) or project site (https://github.com/static-frame/static-frame).
 
